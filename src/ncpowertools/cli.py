@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import signal
 import sys
+import threading
 from collections.abc import Sequence
 
 from .config import Settings, load_settings
@@ -112,8 +114,103 @@ def cmd_list_tags(settings: Settings) -> int:
     return 0
 
 
-def cmd_not_implemented(name: str, milestone: str) -> int:
-    print(f"'{name}' is not yet implemented ({milestone}).")
+def cmd_poll_once(settings: Settings) -> int:
+    """Run a single polling sweep then exit (cron-friendly / smoke target)."""
+    from .nextcloud import NextcloudClient
+    from .pipeline import Pipeline
+    from .poller import Poller
+
+    with NextcloudClient(settings) as client:
+        pipeline = Pipeline(client, settings)
+        poller = Poller(client, pipeline, settings)
+        try:
+            poller.sweep()
+        except NcApiError as exc:
+            log.error("poll-once failed", extra={"error": str(exc)})
+            print(f"poll-once failed: {exc}", file=sys.stderr)
+            return 1
+    return 0
+
+
+def cmd_run(settings: Settings) -> int:
+    """Run the worker: poller thread + webhook server, concurrently.
+
+    Shutdown is graceful on SIGTERM/SIGINT. If neither the poller nor the
+    webhook server is enabled, we error out with guidance rather than idling.
+    """
+    import uvicorn
+
+    from .nextcloud import NextcloudClient
+    from .pipeline import Pipeline
+    from .poller import Poller
+    from .webhook import create_app
+
+    poll_enabled = settings.POLL_INTERVAL > 0
+    hook_enabled = bool(settings.WEBHOOK_SECRET)
+    if not poll_enabled and not hook_enabled:
+        print(
+            "Nothing to run: set POLL_INTERVAL>0 to enable polling and/or "
+            "WEBHOOK_SECRET to enable the webhook server.",
+            file=sys.stderr,
+        )
+        return 2
+
+    client = NextcloudClient(settings)
+    pipeline = Pipeline(client, settings)
+    poller = Poller(client, pipeline, settings)
+    poller_thread: threading.Thread | None = None
+    server: uvicorn.Server | None = None
+
+    if poll_enabled:
+        poller_thread = threading.Thread(
+            target=poller.run_forever, name="ncpt-poller", daemon=True
+        )
+        poller_thread.start()
+        log.info("poller thread started", extra={"interval": settings.POLL_INTERVAL})
+
+    stop = threading.Event()
+
+    def _handle_signal(signum: int, _frame: object) -> None:
+        log.info("shutdown signal received", extra={"signal": signum})
+        poller.stop()
+        if server is not None:
+            server.should_exit = True
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    try:
+        if hook_enabled:
+            app = create_app(pipeline, settings)
+            config = uvicorn.Config(
+                app,
+                host=settings.WEBHOOK_HOST,
+                port=settings.WEBHOOK_PORT,
+                log_config=None,
+                workers=1,
+            )
+            server = uvicorn.Server(config)
+            log.info(
+                "webhook server starting",
+                extra={
+                    "host": settings.WEBHOOK_HOST,
+                    "port": settings.WEBHOOK_PORT,
+                    "path": settings.WEBHOOK_PATH,
+                },
+            )
+            # uvicorn installs its own signal handlers and blocks until exit.
+            server.run()
+        else:
+            # Poller-only: block until a signal sets the stop event.
+            log.info("running poller-only (no webhook secret set)")
+            while not stop.is_set():
+                stop.wait(1.0)
+    finally:
+        poller.stop()
+        if poller_thread is not None:
+            poller_thread.join(timeout=5.0)
+        client.close()
     return 0
 
 
@@ -139,9 +236,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "list-tags":
         return cmd_list_tags(settings)
     if args.command == "poll-once":
-        return cmd_not_implemented("poll-once", "M3")
+        return cmd_poll_once(settings)
     if args.command == "run":
-        return cmd_not_implemented("run", "M3")
+        return cmd_run(settings)
     parser.print_help()  # pragma: no cover - argparse guards this
     return 0
 

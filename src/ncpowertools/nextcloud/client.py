@@ -152,6 +152,24 @@ class NextcloudClient:
                     fh.write(chunk)
         return dest
 
+    def download_dir_as_zip(self, path: str, dest: Path) -> Path:
+        """Download a *folder* as a zip archive to ``dest`` on disk.
+
+        Uses Nextcloud's directory-GET extension: a GET on a collection with
+        ``Accept: application/zip`` streams the folder packed as a zip. We use
+        this for the compress actions on folders so the handler can operate on a
+        single local file/dir (CONTEXT.md §2). The pipeline then extracts it
+        locally to reconstruct the tree before re-compressing.
+        """
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        url = self._files_url(path)
+        with self._client.stream("GET", url, headers={"Accept": "application/zip"}) as resp:
+            self._check(resp, ok=(200,))
+            with dest.open("wb") as fh:
+                for chunk in resp.iter_bytes():
+                    fh.write(chunk)
+        return dest
+
     def upload(self, path: str, data: bytes | IO[bytes]) -> None:
         """PUT raw bytes (or a file object) to ``path`` (overwrites if present)."""
         self._request("PUT", self._files_url(path), content=data, ok=(200, 201, 204))
