@@ -355,6 +355,11 @@ def _parse_7z_listing(stdout: str) -> tuple[int, int, list[str]]:
     cur_path: str | None = None
     cur_size = 0
     cur_is_folder = False
+    # ``7z l -slt`` prints an archive-header block (whose ``Path =`` is the
+    # archive file itself) followed by a ``----------`` separator, after which
+    # the real per-member blocks begin. Only parse members after the separator,
+    # otherwise the archive's own (often absolute) path is mistaken for a member.
+    in_members = False
 
     def flush() -> None:
         nonlocal total, count, cur_path, cur_size, cur_is_folder
@@ -365,6 +370,10 @@ def _parse_7z_listing(stdout: str) -> tuple[int, int, list[str]]:
         cur_path, cur_size, cur_is_folder = None, 0, False
 
     for line in stdout.splitlines():
+        if not in_members:
+            if line.startswith("----------"):
+                in_members = True
+            continue
         if line.startswith("Path = "):
             flush()
             cur_path = line[len("Path = "):].strip()
@@ -374,7 +383,6 @@ def _parse_7z_listing(stdout: str) -> tuple[int, int, list[str]]:
         elif line.startswith("Folder = "):
             cur_is_folder = line[len("Folder = "):].strip() == "+"
     flush()
-    # 7z -slt's first "Path =" is the archive itself; drop it if present.
     return total, count, names
 
 

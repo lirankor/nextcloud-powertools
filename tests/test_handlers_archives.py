@@ -226,19 +226,23 @@ def test_corrupt_zip_raises_handlererror(make_ctx: CtxFactory) -> None:
 
 
 def test_parse_7z_listing() -> None:
+    # Real `7z l -slt` output: an archive-header block (its Path is the archive
+    # file itself, often an absolute path) then a `----------` separator, then
+    # the per-member blocks. Only members after the separator must be parsed.
     out = (
-        "Path = archive.7z\nType = 7z\n\n"
+        "Path = /tmp/archive.7z\nType = 7z\n\n"
+        "----------\n"
         "Path = a.txt\nSize = 100\nFolder = -\n\n"
         "Path = sub\nSize = 0\nFolder = +\n\n"
         "Path = sub/b.txt\nSize = 200\nFolder = -\n"
     )
     total, count, names = _parse_7z_listing(out)
-    # First "Path =" is the archive itself (Folder defaults to -, size 0) — it
-    # is counted as a member with size 0; the two real files dominate.
+    # The archive-header Path is ignored (it lives before the separator).
     assert total == 300
     assert "a.txt" in names and "sub/b.txt" in names
     assert "sub" not in names  # folder skipped
-    assert count == 3  # archive line + 2 files (archive has size 0, harmless)
+    assert "/tmp/archive.7z" not in names  # archive itself is not a member
+    assert count == 2  # the two real files only
 
 
 def test_parse_unrar_listing() -> None:
@@ -268,7 +272,10 @@ def test_extract_7z_mocked(make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
         if argv[1] == "l":
-            stdout = "Path = a.7z\n\nPath = inside.txt\nSize = 5\nFolder = -\n"
+            stdout = (
+                "Path = a.7z\nType = 7z\n\n----------\n"
+                "Path = inside.txt\nSize = 5\nFolder = -\n"
+            )
             return subprocess.CompletedProcess(argv, 0, stdout, "")
         # extraction: actually create the file so outputs are collected.
         dest = next(a[2:] for a in argv if a.startswith("-o"))
@@ -296,7 +303,7 @@ def test_extract_7z_listing_over_limit_mocked(
 
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         assert argv[1] == "l", "extraction must not be attempted past the limit"
-        stdout = "Path = big.bin\nSize = 5000\nFolder = -\n"
+        stdout = "Path = big.7z\nType = 7z\n\n----------\nPath = big.bin\nSize = 5000\nFolder = -\n"
         return subprocess.CompletedProcess(argv, 0, stdout, "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
