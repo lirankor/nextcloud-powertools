@@ -85,8 +85,29 @@ Questions to resolve BEFORE building (ask the owner at research time):
 
 ---
 
+## F4 — More render source types (afphoto, TIFF, AI/EPS/PDF, HEIC, SVG, …)  🟡 researching (directory-level)
+**Requested:** 2026-06-15.
+Extend the render registry beyond PSD + raw so more "files Nextcloud can't preview" convert to a
+viewable PNG/JPG. Requested examples: **`.afphoto`** (Affinity Photo), **`.tiff`**, "and other
+without preview". Works on single files AND folders automatically (F1 walk) — these are just new
+`@renderer` registry entries (+ any delegate package in the Dockerfile).
+
+Likely buckets (pending the research-formats agent):
+- **Easy wins, delegate already installed:** TIFF (libtiff), AI/EPS/PS/PDF (ghostscript, policy
+  already unlocks them), SVG (librsvg — may need two-stage rsvg→PNG→convert for JPG), HEIC
+  (libheif1 — confirm IM6 bookworm delegate), BMP/GIF/WEBP/ICO/TGA (IM native). Register the exts;
+  maybe add one small package.
+- **Hard / likely NOT offline-doable:** **`.afphoto`/`.afdesign`/`.afpub`** are proprietary Serif
+  formats — ImageMagick can't read them. Best case is carving an embedded preview thumbnail; if not
+  reliable, document as unsupported (like F3 stubs). Research agent is determining feasibility.
+
+Plan: research → register easy-win exts (real dockerized smoke per format) → for afphoto, either
+implement embedded-preview extraction if a reliable method exists, or document unsupported.
+
+---
+
 ## Process
-- New requests get appended here with date + status. Build order is F1 → F2 → F3 (F1 unblocks the
-  directory infra; F3 is gated on the clarification above).
+- New requests get appended here with date + status. Build order is F1 → F2 → F4 (render exts) →
+  F3 (F1 unblocks the directory infra; F3 is gated on the clarification above).
 - Each feature, when built, follows the same dark-factory rhythm: spec → dev agent → verify
   (incl. real dockerized smoke for binary-backed tools) → CI green → mark ✅ here + in PLAN.md.
