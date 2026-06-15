@@ -52,6 +52,7 @@ HEIC, AI, …) or a new tag is a few lines.
 | M4 | Packaging & ops | ✅ done | Dockerfile (multi-stage slim non-root, tools, policy.xml, RAR build arg), docker-compose.yml (env, resource limits, cap_drop, restart), GH Actions multi-arch → ghcr, webhook setup script + docs, README, .env.example, LICENSE, .dockerignore/.gitignore. Local buildx smoke. |
 | M5 | Directory-level render (F1) | ✅ done | `render`/`render-png` on a tagged folder → recursively render every registered-type file (PSD today) below it; outputs land beside each source, tree mirrored. See specs/FEATURE_REQUESTS.md F1. |
 | M6 | Raw photo → JPG/PNG (F2) | ✅ done | Register camera-raw exts (CR2/CR3/NEF/ARW/DNG/RAF/ORF/RW2/PEF/SRW) in the render registry via two-stage `dcraw_emu`→TIFF→`convert`. Adds `libraw-bin`. Works on single files + folders (F1 walk). See FEATURE_REQUESTS.md F2. |
+| M7 | Hotfix: fileid→path resolution | 🟡 in progress | LIVE BUG (NC 33.0.5): `resolve_fileid` used an `<oc:fileid>` filter-rule NC ignores → 0 results → everything skipped. Fix: poller carries the `FileRef` (path) it already has from `search_by_tag` through the event; webhook path resolves via supported `PROPFIND /remote.php/dav/meta/{fileid}`. |
 
 Status legend: ⬜ todo · 🟡 in progress · ✅ done · ⚠️ blocked/needs-human
 
