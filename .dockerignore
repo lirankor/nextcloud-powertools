@@ -1,0 +1,39 @@
+# Keep the build context (and image) lean. The Dockerfile only needs
+# pyproject.toml, README.md, and src/ to build the wheel — plus policy.xml,
+# which is COPYed in the runtime stage.
+
+# VCS / CI
+.git
+.github
+.gitignore
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Tests + their fixtures (not needed at runtime; smoke generates its own)
+tests/
+
+# Specs / docs not needed in the image
+specs/
+SECURITY-secret-rotation.md
+
+# Secrets / local
+.env
+*.local
+.DS_Store
+
+# Compose + scripts aren't copied into the image
+docker-compose.yml
+scripts/

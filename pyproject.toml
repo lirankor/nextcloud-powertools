@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ncpowertools"
 version = "0.1.0"
 description = "Isolated Dockerized worker that performs file operations on Nextcloud files via WebDAV/OCS when a user tags them."
-# readme = "README.md"  # re-enable in M4 once README.md exists
+readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Liran Koren", email = "lirankoren@gmail.com" }]

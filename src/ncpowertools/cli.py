@@ -62,6 +62,8 @@ def _check_tools() -> tuple[bool, list[str]]:
 
 def cmd_selftest(settings: Settings) -> int:
     """Two-phase selftest: local tools first, then NC reachability."""
+    import httpx
+
     from .nextcloud import NextcloudClient
 
     ok = True
@@ -93,7 +95,11 @@ def cmd_selftest(settings: Settings) -> int:
             else:
                 spec = client.ensure_tag(tag)
                 report.append(f"  [ok] trigger tag '{tag}' created (id={spec.id})")
-    except (NcApiError, OSError) as exc:
+    except (NcApiError, httpx.HTTPError, OSError) as exc:
+        # httpx transport errors (ConnectError/TimeoutException/…) are HTTPError
+        # subclasses, NOT OSError — catch them so an unreachable NC produces the
+        # clean FAIL report (and tool-check output) instead of a traceback. This
+        # keeps the healthcheck/smoke tolerant of NC being down.
         ok = False
         report.append(f"  [FAIL] Nextcloud check failed: {exc}")
     finally:

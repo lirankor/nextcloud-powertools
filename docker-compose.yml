@@ -1,0 +1,60 @@
+# docker-compose.yml — nextcloud-powertools
+#
+# Validate with:  docker compose config
+# Run with:       docker compose up -d   (after copying .env.example -> .env)
+#
+# Single service, single worker (the poller + per-file lock are in-process —
+# NEVER scale this to >1 replica or run multiple uvicorn workers).
+
+services:
+  ncpowertools:
+    image: ghcr.io/lirankor/nextcloud-powertools:latest
+    # To build locally instead of pulling, comment out `image:` above and
+    # uncomment the block below (optionally add the RAR build arg):
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    #   args:
+    #     ENABLE_RAR: "false"   # set "true" to bake in the proprietary rar binary
+
+    restart: unless-stopped
+    env_file: .env
+
+    # Ports: ONLY needed when using webhooks (NC>=32). Polling needs no inbound
+    # port. Put a TLS-terminating reverse proxy in front (the shared-secret
+    # header is the only auth) and raise its request body-size limit (nginx
+    # default 1MB -> 413 on larger PUTs is on the NC proxy, but keep the worker
+    # proxy generous too). Comment this out for polling-only deployments.
+    ports:
+      - "${WEBHOOK_PORT:-8080}:8080"
+
+    # --- Hardening ---
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    # WORK_DIR (/tmp/ncpowertools) lives under /tmp; mount it as tmpfs so the
+    # root filesystem can stay read-only. Sized to comfortably hold one job's
+    # download + extracted output (raise if you process large archives).
+    tmpfs:
+      - /tmp:size=2g
+
+    # --- Resource limits ---
+    # `mem_limit` / `cpus` are the forms honored by `docker compose` v2 when NOT
+    # running under Swarm. (The Swarm-only `deploy.resources.limits` block is
+    # listed below, commented, for `docker stack deploy` users.)
+    mem_limit: 1536m
+    cpus: "1.5"
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 1536M
+    #       cpus: "1.5"
+
+    healthcheck:
+      test: ["CMD", "python", "-m", "ncpowertools", "selftest"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 15s

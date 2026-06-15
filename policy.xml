@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policymap [
+  <!ELEMENT policymap (policy)+>
+  <!ATTLIST policymap xmlns CDATA #FIXED ''>
+  <!ELEMENT policy EMPTY>
+  <!ATTLIST policy xmlns CDATA #FIXED '' domain NMTOKEN #REQUIRED
+    name NMTOKEN #IMPLIED pattern CDATA #IMPLIED rights NMTOKEN #IMPLIED
+    stealth NMTOKEN #IMPLIED value CDATA #IMPLIED>
+]>
+<!--
+  ImageMagick security policy for nextcloud-powertools.
+
+  Debian's stock policy.xml DISABLES the PDF/PS/EPS coders and caps resources
+  conservatively. This worker renders PSD (and, via the extensible registry,
+  PDF/PS/EPS/AI) so we explicitly re-enable just those coders read|write, while
+  KEEPING the non-coder hardening (MVG/MSL/file URLs disabled) that blocks the
+  known ImageMagick exploit vectors. Resource limits are tuned for a low-power
+  self-hosted box (CONTEXT.md §7).
+-->
+<policymap>
+  <!-- Resource limits: bound memory/disk/time so a malicious image can't OOM
+       or wedge the worker. -->
+  <policy domain="resource" name="memory" value="1GiB"/>
+  <policy domain="resource" name="map" value="2GiB"/>
+  <policy domain="resource" name="area" value="256MP"/>
+  <policy domain="resource" name="width" value="64KP"/>
+  <policy domain="resource" name="height" value="64KP"/>
+  <policy domain="resource" name="disk" value="4GiB"/>
+  <policy domain="resource" name="time" value="300"/>
+  <policy domain="resource" name="thread" value="2"/>
+
+  <!-- Keep the dangerous non-coder vectors disabled (as Debian ships them). -->
+  <policy domain="delegate" rights="none" pattern="HTTPS"/>
+  <policy domain="delegate" rights="none" pattern="HTTP"/>
+  <policy domain="path" rights="none" pattern="@*"/>
+
+  <!-- Re-enable ONLY the coders we render. PSD is the shipped source type;
+       PDF/PS/EPS/AI are unlocked for the extensible render registry (Ghostscript
+       is installed as the delegate). -->
+  <policy domain="coder" rights="read|write" pattern="PSD"/>
+  <policy domain="coder" rights="read|write" pattern="PDF"/>
+  <policy domain="coder" rights="read|write" pattern="PS"/>
+  <policy domain="coder" rights="read|write" pattern="EPS"/>
+  <policy domain="coder" rights="read|write" pattern="AI"/>
+
+  <!-- Keep these scripting/vector coders disabled (classic RCE vectors). -->
+  <policy domain="coder" rights="none" pattern="MSL"/>
+  <policy domain="coder" rights="none" pattern="MVG"/>
+  <policy domain="coder" rights="none" pattern="URL"/>
+  <policy domain="coder" rights="none" pattern="FTP"/>
+  <policy domain="coder" rights="none" pattern="LABEL"/>
+</policymap>
