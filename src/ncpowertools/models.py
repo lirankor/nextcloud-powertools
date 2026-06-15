@@ -43,11 +43,20 @@ class FileRef(BaseModel):
 
 
 class TagEvent(BaseModel):
-    """A normalized tag-assignment event (from webhook or poller)."""
+    """A normalized tag-assignment event (from webhook or poller).
+
+    ``files`` is an optional carrier of *already-resolved* :class:`FileRef`\\ s. The
+    poller fills it from ``search_by_tag`` (which returns the path via the supported
+    ``oc:systemtag`` filter), so the pipeline can use the path directly instead of
+    re-resolving by fileid. The webhook path only has fileids (``files`` empty) and
+    falls back to ``client.resolve_fileid``. ``fileids``/``tagids`` are kept for
+    back-compat and the webhook path.
+    """
 
     uid: str
     fileids: list[int] = Field(default_factory=list)
     tagids: list[int] = Field(default_factory=list)
+    files: list[FileRef] = Field(default_factory=list)
     raw: dict[str, object] = Field(default_factory=dict)
 
 

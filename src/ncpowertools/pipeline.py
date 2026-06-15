@@ -82,10 +82,22 @@ class Pipeline:
     # ----------------------------------------------------------------- #
 
     def process(self, event: TagEvent) -> None:
-        """Process every fileid in ``event`` (best-effort, isolated per file)."""
-        for fileid in event.fileids:
+        """Process every file in ``event`` (best-effort, isolated per file).
+
+        Prefers the pre-resolved :class:`FileRef`\\ s in ``event.files`` (the poller
+        path — path already known via the supported ``oc:systemtag`` search, so we
+        never re-resolve by fileid). Falls back to ``event.fileids`` for the webhook
+        path, where only fileids are delivered and the FileRef is resolved lazily.
+        """
+        # fileid -> pre-resolved FileRef carried on the event (poller path).
+        carried = {ref.fileid: ref for ref in event.files}
+        # Process each carried file; for the webhook path (no carried refs) iterate
+        # the bare fileids. Carried refs take precedence and avoid the broken
+        # resolve_fileid call entirely.
+        fileids = list(carried) if carried else event.fileids
+        for fileid in fileids:
             try:
-                self._process_one(fileid, event)
+                self._process_one(fileid, event, carried.get(fileid))
             except Exception:  # pragma: no cover - defensive: keep the loop alive
                 log.exception("unexpected pipeline error", extra={"fileid": fileid})
 
@@ -93,13 +105,19 @@ class Pipeline:
     # per-file flow
     # ----------------------------------------------------------------- #
 
-    def _process_one(self, fileid: int, event: TagEvent) -> None:
+    def _process_one(
+        self, fileid: int, event: TagEvent, src: FileRef | None = None
+    ) -> None:
         with file_lock(fileid) as acquired:
             if not acquired:
                 log.info("skip: already processing", extra={"fileid": fileid})
                 return
 
-            src = self.client.resolve_fileid(fileid, user=self.settings.TARGET_USER)
+            # Poller path: the FileRef (with path + is_dir) is already resolved and
+            # carried on the event — use it directly. Webhook path: only a fileid is
+            # available, so resolve it via the supported SEARCH method.
+            if src is None:
+                src = self.client.resolve_fileid(fileid, user=self.settings.TARGET_USER)
             if src is None:
                 log.info("skip: fileid not found", extra={"fileid": fileid})
                 return

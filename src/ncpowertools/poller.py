@@ -55,10 +55,15 @@ class Poller:
                 continue
             for ref in refs:
                 seen += 1
+                # Carry the FULL FileRef (with path + is_dir) that search_by_tag
+                # already resolved via the supported oc:systemtag filter, so the
+                # pipeline uses it directly and never re-resolves by fileid (the
+                # oc:fileid filter-rule NC ignores — the LIVE bug, M7).
                 event = TagEvent(
                     uid=self.settings.TARGET_USER,
                     fileids=[ref.fileid],
                     tagids=[tag.id],
+                    files=[ref],
                     raw={"source": "poller", "tag": tag_name},
                 )
                 self.pipeline.process(event)

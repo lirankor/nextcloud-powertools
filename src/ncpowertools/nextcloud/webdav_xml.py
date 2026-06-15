@@ -53,11 +53,66 @@ def _standard_props(parent: etree._Element) -> None:
 
 
 def build_fileid_report(fileid: int) -> bytes:
-    """REPORT body filtering by ``oc:fileid`` (fileid -> path resolution)."""
+    """DEPRECATED / DO NOT USE — kept only as a regression guard.
+
+    This builds an ``oc:filter-files`` REPORT with an ``<oc:fileid>`` filter-rule.
+    **Nextcloud silently ignores the ``oc:fileid`` filter-rule** (verified live on
+    NC 33.0.5: the REPORT returns an empty multistatus), so resolving a fileid this
+    way always yields "not found" and nothing is processed. This was a research
+    error in the original CONTEXT.md §2. The supported fileid -> path resolver on
+    Nextcloud is the WebDAV **SEARCH** method (:func:`build_fileid_search`); the
+    ``oc:fileid`` filter is only honoured inside an ``<oc:systemtag>`` search
+    (:func:`build_systemtag_report`), which is why the poller path works.
+
+    Do not re-introduce this into the client. It exists solely so a test can assert
+    we no longer send it.
+    """
     root = _filter_files_root()
     _standard_props(root)
     rules = etree.SubElement(root, _qn("oc", "filter-rules"))
     etree.SubElement(rules, _qn("oc", "fileid")).text = str(fileid)
+    return _serialize(root)
+
+
+def build_fileid_search(fileid: int, user: str) -> bytes:
+    """SEARCH body resolving a ``fileid`` -> path (the supported NC resolver).
+
+    Nextcloud does NOT expose ownCloud's ``/remote.php/dav/meta/{fileid}`` endpoint
+    (no ``Meta`` collection exists in NC's DAV ``RootCollection``), and the
+    ``oc:fileid`` *filter-rule* on ``oc:filter-files`` is ignored. The documented,
+    supported way to map a fileid to its path on Nextcloud is the WebDAV ``SEARCH``
+    method against ``/remote.php/dav/`` with a ``<d:basicsearch>`` whose ``<d:where>``
+    matches ``<oc:fileid>`` (``oc:fileid`` is both *selectable* and *searchable*).
+
+    We scope the search to ``/files/<user>`` (the user's own namespace) at
+    ``depth: infinity`` and select the props needed to build a :class:`FileRef` in
+    one round-trip — including ``<d:resourcetype/>`` so ``is_dir`` is known without a
+    follow-up PROPFIND.
+
+    See: NC Developer Manual → WebDAV → Search.
+    """
+    root = etree.Element(_qn("d", "searchrequest"), nsmap=NSMAP)
+    basic = etree.SubElement(root, _qn("d", "basicsearch"))
+
+    select = etree.SubElement(basic, _qn("d", "select"))
+    prop = etree.SubElement(select, _qn("d", "prop"))
+    etree.SubElement(prop, _qn("oc", "fileid"))
+    etree.SubElement(prop, _qn("d", "getcontenttype"))
+    etree.SubElement(prop, _qn("d", "getlastmodified"))
+    etree.SubElement(prop, _qn("d", "resourcetype"))
+
+    from_el = etree.SubElement(basic, _qn("d", "from"))
+    scope = etree.SubElement(from_el, _qn("d", "scope"))
+    etree.SubElement(scope, _qn("d", "href")).text = f"/files/{user}"
+    etree.SubElement(scope, _qn("d", "depth")).text = "infinity"
+
+    where = etree.SubElement(basic, _qn("d", "where"))
+    eq = etree.SubElement(where, _qn("d", "eq"))
+    eq_prop = etree.SubElement(eq, _qn("d", "prop"))
+    etree.SubElement(eq_prop, _qn("oc", "fileid"))
+    etree.SubElement(eq, _qn("d", "literal")).text = str(fileid)
+
+    etree.SubElement(basic, _qn("d", "orderby"))
     return _serialize(root)
 
 

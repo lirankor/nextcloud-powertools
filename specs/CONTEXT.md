@@ -42,23 +42,49 @@ Namespaces used everywhere: `DAV:`→`d`, `http://owncloud.org/ns`→`oc`,
   unset!). Single PUT is fine for typical files; chunked upload (v2) is for >few-hundred-MB.
   We use single PUT and document the proxy-limit gotcha.
 
-### fileid → path (REPORT)
+### fileid → path (SEARCH)
 The webhook payload gives `objectIds` (= fileid) and `tagIds`, **no path, no tag name**.
-Resolve fileid→path with `oc:filter-files` REPORT on the user root:
+
+> **CORRECTION (M7, verified live on NC 33.0.5).** The original research here was WRONG.
+> Resolving fileid→path with an `oc:filter-files` REPORT carrying an `<oc:fileid>`
+> **filter-rule** does **NOT** work on Nextcloud: NC **silently ignores** the `oc:fileid`
+> filter-rule and returns an empty multistatus, so every fileid resolved to "not found" and
+> nothing was processed. (The `oc:fileid` filter-rule is honoured only *inside* an
+> `<oc:systemtag>` search — that's why the polling path via `search_by_tag` works.) Also note:
+> ownCloud's `/remote.php/dav/meta/{fileid}` endpoint (`oc:meta-path-for-user`) does **NOT exist
+> in Nextcloud** — there is no `Meta` collection in NC's DAV `RootCollection`, so that approach
+> would fail the same way. **Do not reintroduce either.**
+
+The supported, documented Nextcloud resolver is the WebDAV **SEARCH** method:
 ```
-REPORT /remote.php/dav/files/<user>/   (Content-Type: application/xml)
+SEARCH /remote.php/dav/   (Content-Type: application/xml)
 ```
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<oc:filter-files xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
-  <d:prop><oc:fileid/><d:getcontenttype/><d:getlastmodified/><d:resourcetype/></d:prop>
-  <oc:filter-rules><oc:fileid>12345</oc:fileid></oc:filter-rules>
-</oc:filter-files>
+<d:searchrequest xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:basicsearch>
+    <d:select><d:prop>
+      <oc:fileid/><d:getcontenttype/><d:getlastmodified/><d:resourcetype/>
+    </d:prop></d:select>
+    <d:from><d:scope>
+      <d:href>/files/<user></d:href><d:depth>infinity</d:depth>
+    </d:scope></d:from>
+    <d:where><d:eq>
+      <d:prop><oc:fileid/></d:prop><d:literal>12345</d:literal>
+    </d:eq></d:where>
+    <d:orderby/>
+  </d:basicsearch>
+</d:searchrequest>
 ```
-Each `<d:response>`'s `<d:href>` is the path; URL-decode and strip the
-`/remote.php/dav/files/<user>/` prefix. `<d:resourcetype>` containing `<d:collection/>` ⇒ it's
-a folder. (A bare fileid has no single canonical path if mounted at multiple points; resolve in
-the context of `payload.user.uid`.)
+`oc:fileid` is both *selectable* and *searchable* per the NC WebDAV Search docs, and
+`d:resourcetype` is selectable — so one SEARCH returns the path **and** is_dir. Each
+`<d:response>`'s `<d:href>` is the path; URL-decode and strip the
+`/remote.php/dav/files/<user>/` prefix. `<d:resourcetype>` containing `<d:collection/>` ⇒ folder.
+The scope is the worker's own `/files/<user>` namespace (admins can't read other users' files
+anyway, §1). **Better still:** the poller already has the full `FileRef` (with path) from the
+`oc:systemtag` search, so it carries it through the event and skips fileid resolution entirely;
+SEARCH is only used on the webhook path. Source: NC Developer Manual → Client APIs → WebDAV →
+Search.
 
 ## 3. System tags
 - **List all tags + ids — PROPFIND** `/remote.php/dav/systemtags/` (`Depth: 1`), request props

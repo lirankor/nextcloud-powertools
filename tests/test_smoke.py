@@ -137,15 +137,14 @@ def test_poll_once_sweeps_and_processes(monkeypatch, capsys) -> None:
     respx.route(method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags/").mock(
         return_value=httpx.Response(207, content=SYSTEMTAGS_XML.encode())
     )
-    # search_by_tag(3) -> one zip file with fileid 50 (REPORT on user root, body
-    # differs from resolve but same URL; sequence the two REPORTs by side_effect)
+    # search_by_tag(3) -> one zip file with fileid 50 (REPORT on user root). The
+    # poller now carries this FileRef through the event, so the pipeline does NOT
+    # re-resolve by fileid: a single REPORT suffices and no SEARCH is issued.
     report_url = respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/")
     report_url.mock(
-        side_effect=[
-            httpx.Response(207, content=_file_report(50, "Inbox/a.zip")),  # search_by_tag
-            httpx.Response(207, content=_file_report(50, "Inbox/a.zip")),  # resolve_fileid
-        ]
+        return_value=httpx.Response(207, content=_file_report(50, "Inbox/a.zip"))
     )
+    search_route = respx.route(method="SEARCH", url=f"{BASE}/remote.php/dav/")
     # tags on file 50 -> extract (id 1 per SYSTEMTAGS_XML)
     respx.route(
         method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags-relations/files/50"
@@ -188,3 +187,6 @@ def test_poll_once_sweeps_and_processes(monkeypatch, capsys) -> None:
         c.request.method == "PUT" and c.request.url.path.endswith("/Inbox/a/hello.txt")
         for c in respx.calls
     )
+    # the carried FileRef was used: no fileid SEARCH was issued during polling
+    assert not search_route.called
+    assert report_url.call_count == 1

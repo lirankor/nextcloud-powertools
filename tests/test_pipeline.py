@@ -21,7 +21,7 @@ import respx
 
 from ncpowertools import locking
 from ncpowertools.config import Settings
-from ncpowertools.models import TagEvent
+from ncpowertools.models import FileRef, TagEvent
 from ncpowertools.nextcloud import NextcloudClient
 from ncpowertools.pipeline import Pipeline
 
@@ -98,10 +98,9 @@ def test_zip_success_uploads_to_parent_and_untags(tmp_path: Path) -> None:
     locking._reset()
     settings = _settings(tmp_path)
     _caps(respx)
-    # resolve fileid -> Docs/report.txt
-    respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/").mock(
-        return_value=httpx.Response(207, content=_file_report(42, "Docs/report.txt"))
-    )
+    # Poller path: the FileRef is carried on the event (no resolve REPORT/SEARCH).
+    # Any fileid SEARCH would be a regression, so route it and assert it's unused.
+    search = respx.route(method="SEARCH", url=f"{BASE}/remote.php/dav/")
     # tags on file -> tagid 9 = "zip"
     respx.route(
         method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags-relations/files/42"
@@ -119,9 +118,10 @@ def test_zip_success_uploads_to_parent_and_untags(tmp_path: Path) -> None:
         f"{BASE}/remote.php/dav/systemtags-relations/files/42/9"
     ).mock(return_value=httpx.Response(204))
 
+    src = FileRef(fileid=42, path="Docs/report.txt")
     with NextcloudClient(settings) as client:
         Pipeline(client, settings).process(
-            TagEvent(uid=USER, fileids=[42], tagids=[9])
+            TagEvent(uid=USER, fileids=[42], tagids=[9], files=[src])
         )
 
     assert upload.called
@@ -129,12 +129,57 @@ def test_zip_success_uploads_to_parent_and_untags(tmp_path: Path) -> None:
     assert upload.calls[0].request.url.path.endswith("/Docs/report.txt.zip")
     # trigger-tag relation DELETE issued exactly once
     assert untag.call_count == 1
+    # the carried FileRef was used — no fileid SEARCH (the broken path) was issued
+    assert not search.called
     # NO DELETE was issued against any files/ path (user content)
     for call in respx.calls:
         if call.request.method == "DELETE":
             assert "/systemtags-relations/" in call.request.url.path
     # temp cleaned
     assert not (Path(settings.WORK_DIR) / "42").exists()
+
+
+# --------------------------------------------------------------------------- #
+# webhook path: no carried FileRef -> resolve via SEARCH, then process
+# --------------------------------------------------------------------------- #
+
+
+@respx.mock
+def test_webhook_path_resolves_via_search_then_processes(tmp_path: Path) -> None:
+    """A webhook event carries only a fileid (no FileRef): the pipeline resolves
+    it via the SEARCH method, then runs the action."""
+    locking._reset()
+    settings = _settings(tmp_path)
+    _caps(respx)
+    # No files=[...] on the event -> pipeline must call resolve_fileid -> SEARCH.
+    search = respx.route(method="SEARCH", url=f"{BASE}/remote.php/dav/").mock(
+        return_value=httpx.Response(207, content=_file_report(42, "Docs/report.txt"))
+    )
+    respx.route(
+        method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags-relations/files/42"
+    ).mock(return_value=httpx.Response(207, content=_tags_relation((9, "zip"))))
+    respx.get(f"{BASE}/remote.php/dav/files/{USER}/Docs/report.txt").mock(
+        return_value=httpx.Response(200, content=b"hello world")
+    )
+    respx.route(method="MKCOL").mock(return_value=httpx.Response(405))
+    upload = respx.put(f"{BASE}/remote.php/dav/files/{USER}/Docs/report.txt.zip").mock(
+        return_value=httpx.Response(201)
+    )
+    untag = respx.delete(
+        f"{BASE}/remote.php/dav/systemtags-relations/files/42/9"
+    ).mock(return_value=httpx.Response(204))
+
+    with NextcloudClient(settings) as client:
+        # webhook-style event: fileids only, NO files=[...]
+        Pipeline(client, settings).process(TagEvent(uid=USER, fileids=[42], tagids=[9]))
+
+    # the fileid was resolved via SEARCH (a PROPFIND to /meta/ or filter REPORT
+    # would NOT match this mock) and the action ran end-to-end
+    assert search.called
+    assert "<d:literal>42</d:literal>" in search.calls[0].request.content.decode()
+    assert upload.called
+    assert upload.calls[0].request.url.path.endswith("/Docs/report.txt.zip")
+    assert untag.call_count == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -147,9 +192,6 @@ def test_extract_recreates_subfolder_tree(tmp_path: Path) -> None:
     locking._reset()
     settings = _settings(tmp_path)
     _caps(respx)
-    respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/").mock(
-        return_value=httpx.Response(207, content=_file_report(7, "Inbox/bundle.zip"))
-    )
     respx.route(
         method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags-relations/files/7"
     ).mock(return_value=httpx.Response(207, content=_tags_relation((3, "extract"))))
@@ -165,8 +207,11 @@ def test_extract_recreates_subfolder_tree(tmp_path: Path) -> None:
         return_value=httpx.Response(204)
     )
 
+    src = FileRef(fileid=7, path="Inbox/bundle.zip")
     with NextcloudClient(settings) as client:
-        Pipeline(client, settings).process(TagEvent(uid=USER, fileids=[7], tagids=[3]))
+        Pipeline(client, settings).process(
+            TagEvent(uid=USER, fileids=[7], tagids=[3], files=[src])
+        )
 
     targets = {c.request.url.path for c in uploads.calls}
     assert any(p.endswith("/Inbox/bundle/a/b.txt") for p in targets)
@@ -186,9 +231,6 @@ def test_failure_keeps_tag_assigns_error_and_notifies(tmp_path: Path) -> None:
     locking._reset()
     settings = _settings(tmp_path, NOTIFY=True)
     _caps(respx)
-    respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/").mock(
-        return_value=httpx.Response(207, content=_file_report(5, "Inbox/broken.zip"))
-    )
     respx.route(
         method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags-relations/files/5"
     ).mock(return_value=httpx.Response(207, content=_tags_relation((3, "extract"))))
@@ -221,8 +263,11 @@ def test_failure_keeps_tag_assigns_error_and_notifies(tmp_path: Path) -> None:
         url__regex=rf"{BASE}/ocs/v2.php/apps/notifications/.*"
     ).mock(return_value=httpx.Response(200, json={"ocs": {"meta": {"status": "ok"}}}))
 
+    src = FileRef(fileid=5, path="Inbox/broken.zip")
     with NextcloudClient(settings) as client:
-        Pipeline(client, settings).process(TagEvent(uid=USER, fileids=[5], tagids=[3]))
+        Pipeline(client, settings).process(
+            TagEvent(uid=USER, fileids=[5], tagids=[3], files=[src])
+        )
 
     assert assign.call_count == 1  # ERROR_TAG assigned
     assert untag.call_count == 0  # trigger tag NOT removed (retriable)
@@ -258,9 +303,6 @@ def test_render_png_on_folder_renders_tree(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(render_mod.subprocess, "run", fake_run)
 
-    respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/").mock(
-        return_value=httpx.Response(207, content=_file_report(8, "Album", is_dir=True))
-    )
     respx.route(
         method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags-relations/files/8"
     ).mock(return_value=httpx.Response(207, content=_tags_relation((4, "render-png"))))
@@ -281,8 +323,11 @@ def test_render_png_on_folder_renders_tree(tmp_path: Path, monkeypatch) -> None:
         f"{BASE}/remote.php/dav/systemtags-relations/files/8/4"
     ).mock(return_value=httpx.Response(204))
 
+    src = FileRef(fileid=8, path="Album", is_dir=True)
     with NextcloudClient(settings) as client:
-        Pipeline(client, settings).process(TagEvent(uid=USER, fileids=[8], tagids=[4]))
+        Pipeline(client, settings).process(
+            TagEvent(uid=USER, fileids=[8], tagids=[4], files=[src])
+        )
 
     targets = {c.request.url.path for c in uploads.calls}
     # outputs land beside each source, INSIDE the tagged dir, tree mirrored
@@ -307,9 +352,6 @@ def test_render_on_empty_folder_untags_uploads_nothing(tmp_path: Path) -> None:
     locking._reset()
     settings = _settings(tmp_path)
     _caps(respx)
-    respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/").mock(
-        return_value=httpx.Response(207, content=_file_report(8, "Album", is_dir=True))
-    )
     respx.route(
         method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags-relations/files/8"
     ).mock(return_value=httpx.Response(207, content=_tags_relation((4, "render-png"))))
@@ -320,8 +362,11 @@ def test_render_on_empty_folder_untags_uploads_nothing(tmp_path: Path) -> None:
         f"{BASE}/remote.php/dav/systemtags-relations/files/8/4"
     ).mock(return_value=httpx.Response(204))
 
+    src = FileRef(fileid=8, path="Album", is_dir=True)
     with NextcloudClient(settings) as client:
-        Pipeline(client, settings).process(TagEvent(uid=USER, fileids=[8], tagids=[4]))
+        Pipeline(client, settings).process(
+            TagEvent(uid=USER, fileids=[8], tagids=[4], files=[src])
+        )
 
     # nothing rendered → no PUT, but the trigger tag IS removed (treated success)
     assert not any(c.request.method == "PUT" for c in respx.calls)
@@ -350,9 +395,6 @@ def test_render_png_single_file_still_works(tmp_path: Path, monkeypatch) -> None
 
     monkeypatch.setattr(render_mod.subprocess, "run", fake_run)
 
-    respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/").mock(
-        return_value=httpx.Response(207, content=_file_report(12, "Album/art.psd"))
-    )
     respx.route(
         method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags-relations/files/12"
     ).mock(return_value=httpx.Response(207, content=_tags_relation((4, "render-png"))))
@@ -367,8 +409,11 @@ def test_render_png_single_file_still_works(tmp_path: Path, monkeypatch) -> None
         f"{BASE}/remote.php/dav/systemtags-relations/files/12/4"
     ).mock(return_value=httpx.Response(204))
 
+    src = FileRef(fileid=12, path="Album/art.psd")
     with NextcloudClient(settings) as client:
-        Pipeline(client, settings).process(TagEvent(uid=USER, fileids=[12], tagids=[4]))
+        Pipeline(client, settings).process(
+            TagEvent(uid=USER, fileids=[12], tagids=[4], files=[src])
+        )
 
     assert upload.called
     assert upload.calls[0].request.url.path.endswith("/Album/art.png")
@@ -385,9 +430,6 @@ def test_zip_folder_downloads_archive_and_uploads(tmp_path: Path) -> None:
     locking._reset()
     settings = _settings(tmp_path)
     _caps(respx)
-    respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/").mock(
-        return_value=httpx.Response(207, content=_file_report(11, "Work/proj", is_dir=True))
-    )
     respx.route(
         method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags-relations/files/11"
     ).mock(return_value=httpx.Response(207, content=_tags_relation((9, "zip"))))
@@ -403,8 +445,11 @@ def test_zip_folder_downloads_archive_and_uploads(tmp_path: Path) -> None:
         return_value=httpx.Response(204)
     )
 
+    src = FileRef(fileid=11, path="Work/proj", is_dir=True)
     with NextcloudClient(settings) as client:
-        Pipeline(client, settings).process(TagEvent(uid=USER, fileids=[11], tagids=[9]))
+        Pipeline(client, settings).process(
+            TagEvent(uid=USER, fileids=[11], tagids=[9], files=[src])
+        )
 
     assert upload.called
     assert upload.calls[0].request.url.path.endswith("/Work/proj.zip")

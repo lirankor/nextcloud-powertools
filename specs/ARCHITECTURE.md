@@ -62,8 +62,10 @@ nextcloud-powertools/
 ## Data model (models.py)
 - `TagSpec(id:int|None, name:str)` — a system tag.
 - `FileRef(fileid:int, path:str, is_dir:bool, name:str, parent:str)` — resolved file.
-- `TagEvent(uid:str, fileids:list[int], tagids:list[int], raw:dict)` — normalized from webhook
-  payload OR synthesized by the poller.
+- `TagEvent(uid:str, fileids:list[int], tagids:list[int], files:list[FileRef], raw:dict)` —
+  normalized from webhook payload OR synthesized by the poller. `files` carries pre-resolved
+  `FileRef`s (poller fills it from `search_by_tag`); the pipeline uses them directly and only
+  falls back to `client.resolve_fileid` (webhook path) when `files` is empty.
 - `ActionResult(ok:bool, outputs:list[str], message:str)` — what the handler produced
   (relative paths uploaded), for logging/notification.
 
@@ -93,8 +95,10 @@ def renderer(*exts): ...                 # decorator to register
 
 ## Pipeline (pipeline.py) — the core flow
 1. Receive `TagEvent` (from webhook or poller).
-2. For each fileid: acquire per-fileid lock (skip if held). 
-3. Resolve fileid→`FileRef` (REPORT). Determine which trigger tag(s) are present → action.
+2. For each file: acquire per-fileid lock (skip if held). 
+3. Use the carried `FileRef` (poller path) if present; else resolve fileid→`FileRef` via the
+   WebDAV **SEARCH** method (webhook path — NC ignores the `oc:fileid` filter-rule; see
+   CONTEXT.md §2). Determine which trigger tag(s) are present → action.
 4. Idempotency: if an output already exists / a "done" marker, skip.
 5. Download to `WORK_DIR/<fileid>/src` (GET; for folder + zip action, download-as-archive or
    walk — keep folder handling explicit).
@@ -119,7 +123,8 @@ def renderer(*exts): ...                 # decorator to register
 ## Poller (poller.py)
 - Every `POLL_INTERVAL` seconds (0 = disabled / webhook-only): for each configured trigger tag,
   systemtag-search REPORT → list of `FileRef`; synthesize a `TagEvent` per file (uid = NC_USER)
-  and run the pipeline. Naturally idempotent via the lock + tag removal.
+  carrying that `FileRef` in `files=[ref]` so the pipeline never re-resolves by fileid, and run
+  the pipeline. Naturally idempotent via the lock + tag removal.
 
 ## Entrypoint (cli.py / __main__.py)
 - `run` (default): start poller (if `POLL_INTERVAL>0`) and webhook server (if a secret is set);

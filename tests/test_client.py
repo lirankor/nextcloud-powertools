@@ -113,11 +113,29 @@ def _capabilities_route(respx_mock: respx.MockRouter, major: int = 33) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_build_fileid_report_contains_filter() -> None:
+def test_build_fileid_search_is_search_request_on_user_scope() -> None:
+    body = xml.build_fileid_search(12345, USER).decode()
+    # SEARCH/basicsearch — the supported NC fileid resolver (NOT filter-files).
+    assert "d:searchrequest" in body
+    assert "d:basicsearch" in body
+    # scoped to the user's own files tree at infinite depth
+    assert f"<d:href>/files/{USER}</d:href>" in body
+    assert "<d:depth>infinity</d:depth>" in body
+    # WHERE oc:fileid == literal, and resourcetype selected so is_dir is known
+    assert "<oc:fileid/>" in body
+    assert "<d:literal>12345</d:literal>" in body
+    assert "d:resourcetype" in body
+    # must NOT be the broken oc:filter-files / fileid filter-rule shape
+    assert "filter-files" not in body
+    assert "filter-rules" not in body
+
+
+def test_build_fileid_report_is_deprecated_regression_guard() -> None:
+    # The old (broken) builder still exists ONLY so we can assert we no longer
+    # send it from the client; NC ignores the oc:fileid filter-rule.
     body = xml.build_fileid_report(12345).decode()
     assert "oc:filter-files" in body
     assert "<oc:fileid>12345</oc:fileid>" in body
-    assert "oc:filter-rules" in body
 
 
 def test_build_systemtag_report_contains_filter() -> None:
@@ -238,24 +256,55 @@ def test_ensure_dir_per_level_on_nc30() -> None:
 
 
 @respx.mock
-def test_resolve_fileid_sends_report_and_parses() -> None:
-    url = f"{BASE}/remote.php/dav/files/{USER}/"
-    route = respx.route(method="REPORT", url=url).mock(
+def test_resolve_fileid_uses_search_and_parses() -> None:
+    # The webhook path resolves fileid -> path via the SEARCH method on
+    # /remote.php/dav/ (NOT the old filter-files REPORT NC ignores).
+    url = f"{BASE}/remote.php/dav/"
+    route = respx.route(method="SEARCH", url=url).mock(
         return_value=httpx.Response(207, content=FILE_REPORT_XML.encode())
     )
     with NextcloudClient(_settings()) as c:
         ref = c.resolve_fileid(12345)
     assert ref is not None
     assert ref.fileid == 12345 and ref.path == "Documents/My Archive.zip"
+    assert ref.is_dir is False
     body = route.calls[0].request.content.decode()
-    assert "<oc:fileid>12345</oc:fileid>" in body
+    assert "d:searchrequest" in body
+    assert "<d:literal>12345</d:literal>" in body
+    assert f"<d:href>/files/{USER}</d:href>" in body
     assert route.calls[0].request.headers["Content-Type"] == "application/xml"
+
+
+@respx.mock
+def test_resolve_fileid_does_not_send_old_filter_files_report() -> None:
+    # Regression: we must NEVER send the old oc:filter-files / <oc:fileid> REPORT,
+    # which NC silently ignores (the live bug). Only a SEARCH should fire.
+    search = respx.route(method="SEARCH", url=f"{BASE}/remote.php/dav/").mock(
+        return_value=httpx.Response(207, content=FILE_REPORT_XML.encode())
+    )
+    report = respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/").mock(
+        return_value=httpx.Response(207, content=FILE_REPORT_XML.encode())
+    )
+    with NextcloudClient(_settings()) as c:
+        c.resolve_fileid(12345)
+    assert search.called
+    assert not report.called
+
+
+@respx.mock
+def test_resolve_fileid_folder_sets_is_dir() -> None:
+    respx.route(method="SEARCH", url=f"{BASE}/remote.php/dav/").mock(
+        return_value=httpx.Response(207, content=FOLDER_REPORT_XML.encode())
+    )
+    with NextcloudClient(_settings()) as c:
+        ref = c.resolve_fileid(777)
+    assert ref is not None and ref.is_dir is True and ref.path == "Photos"
 
 
 @respx.mock
 def test_resolve_fileid_not_found_returns_none() -> None:
     empty = '<d:multistatus xmlns:d="DAV:"/>'
-    respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/").mock(
+    respx.route(method="SEARCH", url=f"{BASE}/remote.php/dav/").mock(
         return_value=httpx.Response(207, content=empty.encode())
     )
     with NextcloudClient(_settings()) as c:

@@ -202,12 +202,26 @@ class NextcloudClient:
     # ----------------------------------------------------------------- #
 
     def resolve_fileid(self, fileid: int, user: str | None = None) -> FileRef | None:
-        """Resolve a fileid to a :class:`FileRef` via the oc:filter-files REPORT."""
+        """Resolve a fileid to a :class:`FileRef` via the WebDAV SEARCH method.
+
+        Used for the **webhook path**, where only a fileid is delivered (the poller
+        path already carries a resolved ``FileRef`` and never calls this).
+
+        We use SEARCH — **not** the old ``oc:filter-files`` / ``<oc:fileid>`` REPORT,
+        which Nextcloud silently ignores (verified live on NC 33.0.5: empty
+        multistatus), and **not** ownCloud's ``/remote.php/dav/meta/{fileid}``
+        endpoint, which does not exist in Nextcloud (no ``Meta`` collection in NC's
+        DAV ``RootCollection``). The documented, supported NC resolver is a ``SEARCH``
+        on ``/remote.php/dav/`` matching ``<oc:fileid>`` in a ``<d:where>`` scoped to
+        the user's ``/files/<user>`` tree; the response multistatus is the same shape
+        as a file REPORT (``<d:href>`` + ``<oc:fileid>`` + ``<d:resourcetype>``), so we
+        reuse :func:`parse_file_report` and get ``is_dir`` in the same round-trip.
+        """
         user = user or self.user
-        body = xml.build_fileid_report(fileid)
+        body = xml.build_fileid_search(fileid, user=user)
         resp = self._request(
-            "REPORT",
-            self._files_url("", user=user),
+            "SEARCH",
+            "/remote.php/dav/",
             content=body,
             headers={"Content-Type": "application/xml"},
             ok=(207,),
