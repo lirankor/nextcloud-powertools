@@ -51,6 +51,7 @@ HEIC, AI, …) or a new tag is a few lines.
 | M3 | Orchestration: trigger → pipeline | ✅ done | Pipeline tying client+handlers; per-file lock + idempotency; never-delete-original; error tag + optional notify. Webhook server (constant-time shared-secret validation, payload parse) + polling loop (systemtag search). Entrypoint, graceful shutdown. Unit + smoke. |
 | M4 | Packaging & ops | ✅ done | Dockerfile (multi-stage slim non-root, tools, policy.xml, RAR build arg), docker-compose.yml (env, resource limits, cap_drop, restart), GH Actions multi-arch → ghcr, webhook setup script + docs, README, .env.example, LICENSE, .dockerignore/.gitignore. Local buildx smoke. |
 | M5 | Directory-level render (F1) | ✅ done | `render`/`render-png` on a tagged folder → recursively render every registered-type file (PSD today) below it; outputs land beside each source, tree mirrored. See specs/FEATURE_REQUESTS.md F1. |
+| M6 | Raw photo → JPG/PNG (F2) | 🟡 in progress | Register camera-raw exts (CR2/CR3/NEF/ARW/DNG/RAF/ORF/RW2/PEF/SRW) in the render registry via two-stage `dcraw_emu`→TIFF→`convert`. Adds `libraw-bin`. Works on single files + folders (F1 walk). See FEATURE_REQUESTS.md F2. |
 
 Status legend: ⬜ todo · 🟡 in progress · ✅ done · ⚠️ blocked/needs-human
 
