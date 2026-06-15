@@ -50,6 +50,7 @@ HEIC, AI, …) or a new tag is a few lines.
 | M2 | Action handlers + registry | ✅ done | Handler registry (tag→action), archive extract w/ zip-slip + zip-bomb guards, zip compress, rar compress (opt-in), render registry (PSD→PNG/JPG). Unit tests incl. malicious-archive fixtures; binary-backed handlers via subprocess + dockerized smoke. |
 | M3 | Orchestration: trigger → pipeline | ✅ done | Pipeline tying client+handlers; per-file lock + idempotency; never-delete-original; error tag + optional notify. Webhook server (constant-time shared-secret validation, payload parse) + polling loop (systemtag search). Entrypoint, graceful shutdown. Unit + smoke. |
 | M4 | Packaging & ops | ✅ done | Dockerfile (multi-stage slim non-root, tools, policy.xml, RAR build arg), docker-compose.yml (env, resource limits, cap_drop, restart), GH Actions multi-arch → ghcr, webhook setup script + docs, README, .env.example, LICENSE, .dockerignore/.gitignore. Local buildx smoke. |
+| M5 | Directory-level render (F1) | 🟡 in progress | `render`/`render-png` on a tagged folder → recursively render every registered-type file (PSD today) below it; outputs land beside each source, tree mirrored. See specs/FEATURE_REQUESTS.md F1. |
 
 Status legend: ⬜ todo · 🟡 in progress · ✅ done · ⚠️ blocked/needs-human
 
