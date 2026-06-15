@@ -16,6 +16,32 @@ Two handlers consume the registry:
 
 PSD ships out of the box (CONTEXT.md §7): ``in.psd[0]`` selects Photoshop's
 flattened composite.
+
+Directory-level render (F1)
+---------------------------
+Both handlers also accept a **directory** as the source. ``can_handle`` returns
+True for any directory (the per-file walk decides what actually renders) and for
+a single file only when its extension is registered. ``run`` then:
+
+* **File source** — render the one file beside its source (output named
+  ``<stem>.<fmt>`` directly under ``output_dir()``), unchanged from before.
+* **Directory source** — walk the tree recursively; for every file whose
+  lowercased extension is in :data:`RENDERERS`, render it to the target format,
+  writing the output under ``output_dir()`` at the **same relative path** as the
+  source within the tagged dir (``Album/a.psd`` → ``a.png``, ``Album/sub/b.psd``
+  → ``sub/b.png``). The pipeline then uploads each output into the tagged dir's
+  namespace at the mirrored location. Semantics:
+
+  - Non-registered files are skipped (logged).
+  - ``ctx.max_files`` is a **hard cap on the NUMBER of files rendered**: if more
+    renderable files than the cap are found we raise :class:`HandlerError`
+    (nothing is uploaded) rather than silently truncating.
+  - A directory with **zero** renderable files is a success:
+    ``ActionResult(ok=True, outputs=[], message="nothing to render")`` — not an
+    error (the pipeline still removes the trigger tag).
+  - If an **individual** file fails to render we log it and continue the batch;
+    but if **every** attempted render fails we raise :class:`RenderError` so the
+    failure surfaces (trigger tag kept, retriable).
 """
 
 from __future__ import annotations
@@ -25,7 +51,7 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
-from ..errors import RenderError
+from ..errors import HandlerError, RenderError
 from ..models import ActionResult, FileRef
 from .base import HandlerContext
 
@@ -104,15 +130,99 @@ class _RenderHandler:
         self.target_fmt = target_fmt
 
     def can_handle(self, src: FileRef) -> bool:
-        return not src.is_dir and _src_ext(src.name) in RENDERERS
+        # A directory always passes — the walk decides what actually renders.
+        # A single file passes only when its extension is registered.
+        return src.is_dir or _src_ext(src.name) in RENDERERS
 
     def run(self, ctx: HandlerContext, src_local: Path) -> ActionResult:
+        if src_local.is_dir():
+            return self._run_dir(ctx, src_local)
+        return self._run_file(ctx, src_local)
+
+    # ----------------------------------------------------------------- #
+    # single file (unchanged behavior): output beside the source
+    # ----------------------------------------------------------------- #
+
+    def _run_file(self, ctx: HandlerContext, src_local: Path) -> ActionResult:
         ext = _src_ext(ctx.src.name)
-        render = resolve_renderer(ext)
         out_dir = ctx.output_dir()
         stem = ctx.src.name.rsplit(".", 1)[0] if "." in ctx.src.name else ctx.src.name
         out = out_dir / f"{stem}.{self.target_fmt}"
-        argv = render(src_local, out, self.target_fmt)
+        self._render_one(ext, src_local, out)
+        ctx.logger.info(
+            "rendered file",
+            extra={"src": ctx.src.name, "target": self.target_fmt, "output": out.name},
+        )
+        return ActionResult(ok=True, outputs=[str(out)], message=f"rendered {out.name}")
+
+    # ----------------------------------------------------------------- #
+    # directory walk (F1): render every registered file, tree mirrored
+    # ----------------------------------------------------------------- #
+
+    def _run_dir(self, ctx: HandlerContext, src_dir: Path) -> ActionResult:
+        out_dir = ctx.output_dir()
+        # Deterministic order so output/logs are stable across runs.
+        candidates = sorted(
+            p for p in src_dir.rglob("*") if p.is_file() and _src_ext(p.name) in RENDERERS
+        )
+        if not candidates:
+            ctx.logger.info("nothing to render", extra={"dir": ctx.src.name})
+            return ActionResult(ok=True, outputs=[], message="nothing to render")
+
+        # max_files is a HARD cap on the number of renders we'll perform.
+        if len(candidates) > ctx.max_files:
+            raise HandlerError(
+                f"{len(candidates)} renderable files exceed MAX_FILES cap "
+                f"({ctx.max_files}); aborting (raise MAX_FILES to allow)"
+            )
+
+        outputs: list[str] = []
+        failures = 0
+        total = len(candidates)
+        for src_file in candidates:
+            rel = src_file.relative_to(src_dir)
+            ext = _src_ext(src_file.name)
+            stem = src_file.name.rsplit(".", 1)[0] if "." in src_file.name else src_file.name
+            out = out_dir / rel.parent / f"{stem}.{self.target_fmt}"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self._render_one(ext, src_file, out)
+            except RenderError as exc:
+                failures += 1
+                ctx.logger.warning(
+                    "render failed for file (continuing)",
+                    extra={"file": rel.as_posix(), "error": str(exc)},
+                )
+                continue
+            outputs.append(str(out))
+            ctx.logger.info(
+                "rendered file",
+                extra={"file": rel.as_posix(), "target": self.target_fmt},
+            )
+
+        if not outputs and failures:
+            # Every attempted render failed — surface the failure (retriable).
+            raise RenderError(
+                f"all {failures} render(s) failed under {ctx.src.name}"
+            )
+
+        ctx.logger.info(
+            "rendered directory",
+            extra={"dir": ctx.src.name, "rendered": len(outputs), "found": total},
+        )
+        return ActionResult(
+            ok=True,
+            outputs=outputs,
+            message=f"rendered {len(outputs)} of {total} files",
+        )
+
+    # ----------------------------------------------------------------- #
+    # shared single-render primitive
+    # ----------------------------------------------------------------- #
+
+    def _render_one(self, ext: str, src_file: Path, out: Path) -> None:
+        render = resolve_renderer(ext)
+        argv = render(src_file, out, self.target_fmt)
         proc = subprocess.run(  # noqa: S603 - argv built from controlled parts
             argv,
             capture_output=True,
@@ -126,11 +236,6 @@ class _RenderHandler:
                 f"render produced no output ({ext}->{self.target_fmt}); "
                 f"stderr: {_snippet(proc.stderr)}"
             )
-        ctx.logger.info(
-            "rendered file",
-            extra={"src": ctx.src.name, "target": self.target_fmt, "output": out.name},
-        )
-        return ActionResult(ok=True, outputs=[str(out)], message=f"rendered {out.name}")
 
 
 class RenderPngHandler(_RenderHandler):

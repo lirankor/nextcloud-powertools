@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from ncpowertools.errors import RenderError
+from ncpowertools.errors import HandlerError, RenderError
 from ncpowertools.handlers import resolve
 from ncpowertools.handlers.base import HandlerContext
 from ncpowertools.handlers.render import (
@@ -19,6 +19,7 @@ from ncpowertools.handlers.render import (
     renderer,
     resolve_renderer,
 )
+from ncpowertools.models import FileRef
 
 CtxFactory = Callable[..., HandlerContext]
 
@@ -169,10 +170,185 @@ def test_render_handlers_via_registry() -> None:
 
 def test_can_handle_checks_extension(make_ctx: CtxFactory) -> None:
     handler = RenderPngHandler()
-    from ncpowertools.models import FileRef
-
     assert handler.can_handle(FileRef(fileid=1, path="x.psd", name="x.psd"))
     assert not handler.can_handle(FileRef(fileid=1, path="x.txt", name="x.txt"))
+
+
+def test_can_handle_accepts_any_directory(make_ctx: CtxFactory) -> None:
+    """A dir always passes can_handle — the walk decides per file (F1)."""
+    handler = RenderPngHandler()
+    # Even a dir whose own name has no registered ext should pass.
+    assert handler.can_handle(FileRef(fileid=1, path="Album", is_dir=True, name="Album"))
+    assert handler.can_handle(
+        FileRef(fileid=1, path="x.txt", is_dir=True, name="x.txt")
+    )
+
+
+# --- directory walk (F1) -------------------------------------------------------
+
+
+def _seed_tree(root: Path) -> None:
+    """Create a 2-level tree: a.psd, sub/b.psd, notes.txt, sub/cover.jpg(non-reg)."""
+    (root / "a.psd").write_bytes(b"8BPS")
+    (root / "sub").mkdir(parents=True, exist_ok=True)
+    (root / "sub" / "b.psd").write_bytes(b"8BPS")
+    (root / "notes.txt").write_text("hi")
+    (root / "sub" / "cover.jpg").write_bytes(b"\xff\xd8\xff")  # jpg not registered
+
+
+def _fake_render(
+    monkeypatch: pytest.MonkeyPatch, magic_bytes: bytes = b"\x89PNG"
+) -> list[list[str]]:
+    """Patch magick + subprocess.run; record argv per call; write output files."""
+    _patch_magick(monkeypatch)
+    captured: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(argv)
+        Path(argv[-1]).write_bytes(magic_bytes)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return captured
+
+
+def test_dir_walk_renders_only_registered_exts_tree_preserved(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _fake_render(monkeypatch)
+    ctx = make_ctx("Album", is_dir=True)
+    src_dir = ctx.work_dir / "src" / "Album"
+    src_dir.mkdir(parents=True)
+    _seed_tree(src_dir)
+
+    result = RenderPngHandler().run(ctx, src_dir)
+    assert result.ok
+    out_root = ctx.output_dir()
+    rels = sorted(Path(o).relative_to(out_root).as_posix() for o in result.outputs)
+    # only the two PSDs rendered; tree preserved; txt + jpg skipped
+    assert rels == ["a.png", "sub/b.png"]
+    assert result.message == "rendered 2 of 2 files"
+    # per-file argv carries the [0] selector + -background none flags
+    for argv in captured:
+        assert argv[1].endswith("[0]")
+        assert "-background" in argv and "none" in argv
+
+
+def test_dir_walk_jpg_target(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_render(monkeypatch, magic_bytes=b"\xff\xd8\xff")
+    ctx = make_ctx("Album", is_dir=True)
+    src_dir = ctx.work_dir / "src" / "Album"
+    src_dir.mkdir(parents=True)
+    _seed_tree(src_dir)
+
+    result = RenderJpgHandler().run(ctx, src_dir)
+    out_root = ctx.output_dir()
+    rels = sorted(Path(o).relative_to(out_root).as_posix() for o in result.outputs)
+    assert rels == ["a.jpg", "sub/b.jpg"]
+
+
+def test_dir_walk_max_files_cap_enforced(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_render(monkeypatch)
+    ctx = make_ctx("Album", is_dir=True, max_files=1)  # only 1 render allowed
+    src_dir = ctx.work_dir / "src" / "Album"
+    src_dir.mkdir(parents=True)
+    _seed_tree(src_dir)  # two PSDs > cap
+
+    with pytest.raises(HandlerError, match="MAX_FILES"):
+        RenderPngHandler().run(ctx, src_dir)
+
+
+def test_dir_walk_empty_or_no_match_is_success(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_render(monkeypatch)
+    ctx = make_ctx("Album", is_dir=True)
+    src_dir = ctx.work_dir / "src" / "Album"
+    (src_dir / "sub").mkdir(parents=True)
+    (src_dir / "notes.txt").write_text("hi")  # nothing renderable
+
+    result = RenderPngHandler().run(ctx, src_dir)
+    assert result.ok
+    assert result.outputs == []
+    assert result.message == "nothing to render"
+
+
+def test_dir_walk_continues_on_single_failure(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_magick(monkeypatch)
+    ctx = make_ctx("Album", is_dir=True)
+    src_dir = ctx.work_dir / "src" / "Album"
+    src_dir.mkdir(parents=True)
+    (src_dir / "good.psd").write_bytes(b"8BPS")
+    (src_dir / "bad.psd").write_bytes(b"8BPS")
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "bad.psd" in argv[1]:
+            return subprocess.CompletedProcess(argv, 1, "", "convert: boom")
+        Path(argv[-1]).write_bytes(b"\x89PNG")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = RenderPngHandler().run(ctx, src_dir)
+    # one failed, one succeeded — batch continues, 1 of 2 rendered
+    assert result.ok
+    rels = [Path(o).name for o in result.outputs]
+    assert rels == ["good.png"]
+    assert result.message == "rendered 1 of 2 files"
+
+
+def test_dir_walk_all_failures_raises(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_magick(monkeypatch)
+    ctx = make_ctx("Album", is_dir=True)
+    src_dir = ctx.work_dir / "src" / "Album"
+    src_dir.mkdir(parents=True)
+    (src_dir / "a.psd").write_bytes(b"8BPS")
+    (src_dir / "b.psd").write_bytes(b"8BPS")
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 1, "", "convert: boom")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(RenderError, match="all .* render"):
+        RenderPngHandler().run(ctx, src_dir)
+
+
+def test_dir_walk_renders_a_dummy_registered_ext(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Register a new source ext → a dir containing it renders (extensibility)."""
+
+    @renderer("foobar")
+    def _foo(src: Path, out: Path, fmt: str) -> list[str]:
+        return ["true", str(src), str(out)]
+
+    captured: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(argv)
+        Path(argv[-1]).write_bytes(b"x")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    try:
+        ctx = make_ctx("Album", is_dir=True)
+        src_dir = ctx.work_dir / "src" / "Album"
+        src_dir.mkdir(parents=True)
+        (src_dir / "thing.foobar").write_bytes(b"\x00")
+        (src_dir / "skip.txt").write_text("no")
+        result = RenderPngHandler().run(ctx, src_dir)
+        rels = [Path(o).name for o in result.outputs]
+        assert rels == ["thing.png"]
+        assert captured[0][0] == "true"
+    finally:
+        RENDERERS.pop("foobar", None)
 
 
 # --- real render (skipped on hosts without ImageMagick) -----------------------
@@ -212,3 +388,25 @@ def test_render_psd_to_png_real_has_alpha(make_ctx: CtxFactory) -> None:
         text=True,
     )
     assert "a" in probe.stdout.lower()  # rgba / graya etc.
+
+
+@pytest.mark.skipif(
+    shutil.which("magick") is None and shutil.which("convert") is None,
+    reason="ImageMagick not available",
+)
+def test_render_dir_two_level_psd_tree_real(make_ctx: CtxFactory) -> None:
+    """Real ImageMagick render of a 2-level PSD tree (F1 dir walk)."""
+    ctx = make_ctx("Album", is_dir=True)
+    src_dir = ctx.work_dir / "src" / "Album"
+    (src_dir / "sub").mkdir(parents=True)
+    if not _make_psd(src_dir / "a.psd") or not _make_psd(src_dir / "sub" / "b.psd"):
+        pytest.skip("could not create test PSDs")
+    (src_dir / "notes.txt").write_text("not renderable")
+
+    result = RenderPngHandler().run(ctx, src_dir)
+    assert result.ok
+    out_root = ctx.output_dir()
+    rels = sorted(Path(o).relative_to(out_root).as_posix() for o in result.outputs)
+    assert rels == ["a.png", "sub/b.png"]
+    for o in result.outputs:
+        assert Path(o).exists() and Path(o).stat().st_size > 0

@@ -23,12 +23,21 @@ Safety invariants enforced here (CONTEXT.md §9):
   failing file isn't reprocessed every sweep. The marker clears on success or
   when the file's mtime changes.
 
-Folder handling: ``extract``/``render`` don't apply to folders (their
-``can_handle`` returns False -> we skip with a clear log). The compress actions
-(``zip``/``rar``/``7z``) DO apply: we download the folder as a zip via the NC
-directory-GET extension, unpack it locally to reconstruct the tree, then hand
-that local directory to the handler. This keeps folder support in one robust
-place and reuses the existing streaming download.
+Folder handling: ``extract`` doesn't apply to folders (its ``can_handle``
+returns False -> we skip with a clear log). The compress actions
+(``zip``/``rar``/``7z``) and the **render** actions (``render``/``render-png``,
+F1) DO apply: we download the folder as a zip via the NC directory-GET
+extension, unpack it locally to reconstruct the tree, then hand that local
+directory to the handler. This keeps folder support in one robust place and
+reuses the existing streaming download.
+
+Output upload base: outputs are uploaded preserving their relative path under
+``ctx.output_dir()``. For a **file** source that base is the source's PARENT
+folder (``extract`` writes a subfolder beside the archive; a single render lands
+beside its source). For a **directory** source (compress / dir-render) the base
+is the tagged directory ITSELF, so a rendered ``sub/b.png`` lands at
+``<dir>/sub/b.png`` mirroring the source tree. We never re-upload the originals
+and never DELETE user content.
 """
 
 from __future__ import annotations
@@ -51,8 +60,9 @@ if TYPE_CHECKING:
 
 log = get_logger("pipeline")
 
-# Actions that produce a single archive and therefore can act on a FOLDER source.
-_FOLDER_CAPABLE_ACTIONS = frozenset({"zip", "rar", "7z"})
+# Render actions that, on a FOLDER source, walk the tree and render per file (F1)
+# — and whose outputs upload INTO the tagged dir (tree mirrored), not its parent.
+_RENDER_ACTIONS = frozenset({"render", "render-png"})
 
 
 class Pipeline:
@@ -153,7 +163,7 @@ class Pipeline:
         )
         result: ActionResult = handler.run(ctx, src_local)
 
-        self._upload_outputs(src, ctx, result)
+        self._upload_outputs(src, action, ctx, result)
 
         # Success: remove the trigger tag (idempotent; makes it re-runnable).
         self.client.remove_tag(src.fileid, trigger_tagid)
@@ -180,7 +190,7 @@ class Pipeline:
     def _download(self, src: FileRef, work: Path, action: str) -> Path:
         """Place the source locally and return the path the handler operates on."""
         if src.is_dir:
-            # Only compress actions reach here (others fail can_handle earlier).
+            # Compress + render dir actions reach here; extract fails can_handle.
             return self._download_folder(src, work)
         dest = work / "src" / src.name
         self.client.download_to(src.path, dest)
@@ -217,16 +227,22 @@ class Pipeline:
     # upload (into the SOURCE's PARENT folder, preserving the output tree)
     # ----------------------------------------------------------------- #
 
-    def _upload_outputs(self, src: FileRef, ctx: HandlerContext, result: ActionResult) -> None:
+    def _upload_outputs(
+        self, src: FileRef, action: str, ctx: HandlerContext, result: ActionResult
+    ) -> None:
         out_root = ctx.output_dir().resolve()
-        parent = src.parent  # "" means the user root
+        # For a dir-render the outputs mirror the tagged dir's tree, so they
+        # upload INTO the tagged dir. Everything else (file render, extract,
+        # compress) uploads into the source's PARENT folder (base "" = user root).
+        into_dir = src.is_dir and action in _RENDER_ACTIONS
+        base = src.path.strip("/") if into_dir else src.parent
         # Pre-create every distinct subfolder under the parent (extract creates
         # a <stem>/a/b tree). ensure_dir is idempotent and handles AutoMkcol.
         made: set[str] = set()
         for out_str in result.outputs:
             out = Path(out_str).resolve()
             rel = out.relative_to(out_root).as_posix()
-            remote = f"{parent}/{rel}" if parent else rel
+            remote = f"{base}/{rel}" if base else rel
             sub = remote.rsplit("/", 1)[0] if "/" in remote else ""
             if sub and sub not in made:
                 self.client.ensure_dir(sub)

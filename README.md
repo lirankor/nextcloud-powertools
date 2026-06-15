@@ -35,6 +35,15 @@ The map is configurable via `TAG_ACTIONS`. `render`/`render-png` use an
 extensible renderer registry — adding a source type (SVG, TIFF, HEIC, AI, …) is
 a few lines (see [How to extend](#how-to-extend)).
 
+**Folders are supported.** Tagging a **directory** with `render` / `render-png`
+recursively renders **every file below it** whose type is registered (PSD
+today), writing each output **beside its source** with the subtree mirrored
+(`Album/a.psd` → `Album/a.png`, `Album/sub/b.psd` → `Album/sub/b.png`).
+Non-renderable files (e.g. `notes.txt`) are skipped; a folder with nothing to
+render is treated as success (the trigger tag is removed). The number of files
+rendered is capped by `MAX_FILES`. Originals are never modified or deleted.
+(`zip`/`rar`/`7z` already act on folders too, compressing the whole tree.)
+
 ## Security model
 
 Isolation is the whole point of this design:
@@ -199,9 +208,11 @@ def _render_svg(src: Path, out: Path, fmt: str) -> list[str]:
     return [binary, "-background", "white", "-flatten", str(src), str(out)]
 ```
 
-Then both `render-png` (PNG) and `render` (JPG) work for that extension. For a
-new delegate (e.g. HEIC), add the apt package (`libheif1`) in the `Dockerfile`
-runtime stage — most are already installed.
+Then both `render-png` (PNG) and `render` (JPG) work for that extension —
+for **single files and tagged folders alike** (the directory walk renders any
+registered extension automatically). For a new delegate (e.g. HEIC), add the apt
+package (`libheif1`) in the `Dockerfile` runtime stage — most are already
+installed.
 
 ## RAR opt-in
 

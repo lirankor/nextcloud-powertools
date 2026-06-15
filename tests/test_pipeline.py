@@ -231,28 +231,148 @@ def test_failure_keeps_tag_assigns_error_and_notifies(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# folder + render skipped (can_handle False), no upload/untag
+# folder + render-png (F1): download subtree, walk+render, upload to mirrored
+# paths INSIDE the tagged dir, untag, never DELETE / re-upload originals
 # --------------------------------------------------------------------------- #
 
 
 @respx.mock
-def test_render_on_folder_is_skipped(tmp_path: Path) -> None:
+def test_render_png_on_folder_renders_tree(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
     locking._reset()
     settings = _settings(tmp_path)
     _caps(respx)
+    # Pretend ImageMagick is present and render by writing a tiny PNG to argv[-1].
+    import subprocess as _subprocess
+
+    from ncpowertools.handlers import render as render_mod
+
+    monkeypatch.setattr(
+        render_mod.shutil,
+        "which",
+        lambda name: "/usr/bin/convert" if name in ("magick", "convert") else None,
+    )
+
+    def fake_run(argv, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        Path(argv[-1]).write_bytes(b"\x89PNG\r\n\x1a\n")
+        return _subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(render_mod.subprocess, "run", fake_run)
+
     respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/").mock(
-        return_value=httpx.Response(207, content=_file_report(8, "Pics", is_dir=True))
+        return_value=httpx.Response(207, content=_file_report(8, "Album", is_dir=True))
     )
     respx.route(
         method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags-relations/files/8"
     ).mock(return_value=httpx.Response(207, content=_tags_relation((4, "render-png"))))
+    # directory GET returns a zip of the folder: a.psd, sub/b.psd, notes.txt
+    respx.get(f"{BASE}/remote.php/dav/files/{USER}/Album").mock(
+        return_value=httpx.Response(
+            200,
+            content=_zip_bytes(
+                {"a.psd": b"8BPS", "sub/b.psd": b"8BPS", "notes.txt": b"hi"}
+            ),
+        )
+    )
+    respx.route(method="MKCOL").mock(return_value=httpx.Response(201))
+    uploads = respx.put(
+        url__regex=rf"{BASE}/remote.php/dav/files/{USER}/Album/.*"
+    ).mock(return_value=httpx.Response(201))
+    untag = respx.delete(
+        f"{BASE}/remote.php/dav/systemtags-relations/files/8/4"
+    ).mock(return_value=httpx.Response(204))
 
     with NextcloudClient(settings) as client:
         Pipeline(client, settings).process(TagEvent(uid=USER, fileids=[8], tagids=[4]))
 
-    # no upload, no untag, no error tag — just a skip
+    targets = {c.request.url.path for c in uploads.calls}
+    # outputs land beside each source, INSIDE the tagged dir, tree mirrored
+    assert any(p.endswith("/Album/a.png") for p in targets)
+    assert any(p.endswith("/Album/sub/b.png") for p in targets)
+    # exactly the two renderable files were uploaded — nothing else
+    assert len(targets) == 2
+    # the non-renderable notes.txt was NOT re-uploaded
+    assert not any(p.endswith("notes.txt") for p in targets)
+    # the originals (.psd) were never re-uploaded
+    assert not any(p.endswith(".psd") for p in targets)
+    # trigger tag removed; no DELETE on user content
+    assert untag.call_count == 1
+    for call in respx.calls:
+        if call.request.method == "DELETE":
+            assert "/systemtags-relations/" in call.request.url.path
+
+
+@respx.mock
+def test_render_on_empty_folder_untags_uploads_nothing(tmp_path: Path) -> None:
+    """A folder with no renderable files → success: untag, no upload, no error."""
+    locking._reset()
+    settings = _settings(tmp_path)
+    _caps(respx)
+    respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/").mock(
+        return_value=httpx.Response(207, content=_file_report(8, "Album", is_dir=True))
+    )
+    respx.route(
+        method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags-relations/files/8"
+    ).mock(return_value=httpx.Response(207, content=_tags_relation((4, "render-png"))))
+    respx.get(f"{BASE}/remote.php/dav/files/{USER}/Album").mock(
+        return_value=httpx.Response(200, content=_zip_bytes({"notes.txt": b"hi"}))
+    )
+    untag = respx.delete(
+        f"{BASE}/remote.php/dav/systemtags-relations/files/8/4"
+    ).mock(return_value=httpx.Response(204))
+
+    with NextcloudClient(settings) as client:
+        Pipeline(client, settings).process(TagEvent(uid=USER, fileids=[8], tagids=[4]))
+
+    # nothing rendered → no PUT, but the trigger tag IS removed (treated success)
     assert not any(c.request.method == "PUT" for c in respx.calls)
-    assert not any(c.request.method == "DELETE" for c in respx.calls)
+    assert untag.call_count == 1
+
+
+@respx.mock
+def test_render_png_single_file_still_works(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """Single-FILE render is unchanged: output beside the source in its parent."""
+    locking._reset()
+    settings = _settings(tmp_path)
+    _caps(respx)
+    import subprocess as _subprocess
+
+    from ncpowertools.handlers import render as render_mod
+
+    monkeypatch.setattr(
+        render_mod.shutil,
+        "which",
+        lambda name: "/usr/bin/convert" if name in ("magick", "convert") else None,
+    )
+
+    def fake_run(argv, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        Path(argv[-1]).write_bytes(b"\x89PNG\r\n\x1a\n")
+        return _subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(render_mod.subprocess, "run", fake_run)
+
+    respx.route(method="REPORT", url=f"{BASE}/remote.php/dav/files/{USER}/").mock(
+        return_value=httpx.Response(207, content=_file_report(12, "Album/art.psd"))
+    )
+    respx.route(
+        method="PROPFIND", url=f"{BASE}/remote.php/dav/systemtags-relations/files/12"
+    ).mock(return_value=httpx.Response(207, content=_tags_relation((4, "render-png"))))
+    respx.get(f"{BASE}/remote.php/dav/files/{USER}/Album/art.psd").mock(
+        return_value=httpx.Response(200, content=b"8BPS")
+    )
+    respx.route(method="MKCOL").mock(return_value=httpx.Response(201))
+    upload = respx.put(
+        f"{BASE}/remote.php/dav/files/{USER}/Album/art.png"
+    ).mock(return_value=httpx.Response(201))
+    untag = respx.delete(
+        f"{BASE}/remote.php/dav/systemtags-relations/files/12/4"
+    ).mock(return_value=httpx.Response(204))
+
+    with NextcloudClient(settings) as client:
+        Pipeline(client, settings).process(TagEvent(uid=USER, fileids=[12], tagids=[4]))
+
+    assert upload.called
+    assert upload.calls[0].request.url.path.endswith("/Album/art.png")
+    assert untag.call_count == 1
 
 
 # --------------------------------------------------------------------------- #

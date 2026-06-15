@@ -10,8 +10,8 @@ built for **F1** is the shared foundation F2/F3 reuse.
 
 ---
 
-## F1 — Directory-level render (PSD→image on a tagged folder)  🟡 queued
-**Requested:** 2026-06-15. Starts after the M4 CI run is green + image published.
+## F1 — Directory-level render (PSD→image on a tagged folder)  ✅ done
+**Requested:** 2026-06-15. **Shipped:** 2026-06-15 (M5). Done after M4 CI green.
 Make `render-png` / `render` (and any future render-registry source type) also work when a
 **directory** is tagged: recursively render every file below it whose extension is registered in
 `RENDERERS` (PSD today). Non-renderable files skipped (logged). Outputs land **beside each source
