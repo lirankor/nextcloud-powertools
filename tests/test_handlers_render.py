@@ -13,10 +13,14 @@ from ncpowertools.errors import HandlerError, RenderError
 from ncpowertools.handlers import resolve
 from ncpowertools.handlers.base import HandlerContext
 from ncpowertools.handlers.render import (
+    AFFINITY_EXTS,
+    RASTER_EXTS,
     RAW_EXTS,
     RENDERERS,
+    VECTOR_PAGE_EXTS,
     RenderJpgHandler,
     RenderPngHandler,
+    _carve_largest_png,
     renderer,
     resolve_renderer,
 )
@@ -141,8 +145,8 @@ def test_render_unknown_source_ext_raises(
     make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_magick(monkeypatch)
-    ctx = make_ctx("photo.heic")
-    src = ctx.work_dir / "photo.heic"
+    ctx = make_ctx("mystery.zzz")
+    src = ctx.work_dir / "mystery.zzz"
     src.write_bytes(b"\x00")
     with pytest.raises(RenderError, match="no renderer for source extension"):
         RenderPngHandler().run(ctx, src)
@@ -625,3 +629,254 @@ def test_render_raw_real(make_ctx: CtxFactory, tmp_path: Path) -> None:
     result = RenderJpgHandler().run(ctx, src)
     out = Path(result.outputs[0])
     assert out.exists() and out.stat().st_size > 0
+
+
+# --- F4: more render source types (M8) ----------------------------------------
+
+
+def _make_png_bytes(width: int = 1, height: int = 1) -> bytes:
+    """Build a minimal, valid PNG (signature..IEND+CRC) with zlib/struct."""
+    import struct
+    import zlib
+
+    def chunk(typ: bytes, data: bytes) -> bytes:
+        body = typ + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # RGB, 8-bit
+    # One uncompressed scanline per row: filter byte 0 + width*3 bytes.
+    raw = b"".join(b"\x00" + b"\xff\x00\x00" * width for _ in range(height))
+    idat = zlib.compress(raw)
+    return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def test_new_raster_and_vector_exts_registered() -> None:
+    for ext in (*RASTER_EXTS, *VECTOR_PAGE_EXTS, "svg", "svgz", *AFFINITY_EXTS):
+        assert ext in RENDERERS
+    # A couple resolve-and-route checks.
+    assert resolve_renderer("tiff") is resolve_renderer("tif")
+    assert resolve_renderer("heic") is resolve_renderer("webp")
+    assert resolve_renderer("pdf") is resolve_renderer("ai")
+    assert resolve_renderer("svg") is resolve_renderer("svgz")
+
+
+def test_raster_png_argv(make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _fake_render(monkeypatch)
+    ctx = make_ctx("scan.tiff")
+    src = ctx.work_dir / "scan.tiff"
+    src.write_bytes(b"II*\x00")
+    result = RenderPngHandler().run(ctx, src)
+    assert result.ok
+    argv = captured[0]
+    assert argv[0] == "/usr/bin/magick"
+    assert argv[1] == f"{src}[0]"
+    assert "-density" not in argv  # raster: no density
+    assert argv[-1].endswith("scan.png")
+
+
+def test_raster_jpg_flatten_white(make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _fake_render(monkeypatch, magic_bytes=b"\xff\xd8\xff")
+    ctx = make_ctx("pic.webp")
+    src = ctx.work_dir / "pic.webp"
+    src.write_bytes(b"RIFF")
+    result = RenderJpgHandler().run(ctx, src)
+    assert result.ok
+    argv = captured[0]
+    assert argv[1] == f"{src}[0]"
+    assert "-background" in argv and "white" in argv and "-flatten" in argv
+    assert argv[argv.index("-quality") + 1] == "90"
+    assert argv[-1].endswith("pic.jpg")
+
+
+def test_vector_density_present_for_pdf_ai_eps_ps(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for ext in ("pdf", "ai", "eps", "ps"):
+        captured = _fake_render(monkeypatch)
+        ctx = make_ctx(f"doc.{ext}")
+        src = ctx.work_dir / f"doc.{ext}"
+        src.write_bytes(b"%PDF")
+        RenderPngHandler().run(ctx, src)
+        argv = captured[0]
+        # -density 150 must come BEFORE the input.
+        assert argv[1:3] == ["-density", "150"], ext
+        assert argv[3] == f"{src}[0]", ext
+        assert argv[-1].endswith("doc.png"), ext
+
+
+def test_svg_png_uses_rsvg(make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in ("rsvg-convert", "magick", "convert") else None,
+    )
+    captured: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(argv)
+        # rsvg-convert -o <out> <src> writes the output named after -o.
+        out = argv[argv.index("-o") + 1] if "-o" in argv else argv[-1]
+        Path(out).write_bytes(b"\x89PNG")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ctx = make_ctx("logo.svg")
+    src = ctx.work_dir / "logo.svg"
+    src.write_text("<svg/>")
+    result = RenderPngHandler().run(ctx, src)
+    assert result.ok
+    argv = captured[0]
+    assert argv[0] == "/usr/bin/rsvg-convert"
+    assert argv[1] == "-o"  # -o <out> <src>
+    assert Path(argv[2]).name == "logo.png"
+    assert argv[3] == str(src)
+
+
+def test_svg_jpg_pipes_rsvg_into_convert(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in ("rsvg-convert", "magick", "convert") else None,
+    )
+    captured: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        captured.append(argv)
+        # stage2 (convert) writes the output; stage1 (rsvg) returns PNG on stdout.
+        if Path(argv[0]).name == "rsvg-convert":
+            return subprocess.CompletedProcess(argv, 0, b"\x89PNGfake", b"")
+        Path(argv[-1]).write_bytes(b"\xff\xd8\xff")
+        assert kwargs.get("input") == b"\x89PNGfake"  # piped through
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ctx = make_ctx("logo.svg")
+    src = ctx.work_dir / "logo.svg"
+    src.write_text("<svg/>")
+    result = RenderJpgHandler().run(ctx, src)
+    assert result.ok
+    assert len(captured) == 2
+    assert Path(captured[0][0]).name == "rsvg-convert"
+    assert captured[0] == ["/usr/bin/rsvg-convert", str(src)]
+    stage2 = captured[1]
+    assert Path(stage2[0]).name in ("magick", "convert")
+    assert stage2[1] == "png:-"  # reads stdin
+    assert "-flatten" in stage2 and "white" in stage2
+    assert stage2[-1].endswith("logo.jpg")
+
+
+def test_svg_missing_rsvg_raises(make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/usr/bin/convert" if name == "convert" else None
+    )
+    ctx = make_ctx("logo.svg")
+    src = ctx.work_dir / "logo.svg"
+    src.write_text("<svg/>")
+    with pytest.raises(RenderError, match="rsvg-convert"):
+        RenderPngHandler().run(ctx, src)
+
+
+# --- Affinity embedded-PNG carver (real, no binary) ---------------------------
+
+
+def test_carver_extracts_embedded_png() -> None:
+    png = _make_png_bytes()
+    blob = b"junkheader" + png + b"trailingjunk"
+    assert _carve_largest_png(blob) == png
+
+
+def test_carver_no_png_returns_none() -> None:
+    assert _carve_largest_png(b"no png here at all") is None
+
+
+def test_carver_picks_largest_of_two() -> None:
+    small = _make_png_bytes(1, 1)
+    big = _make_png_bytes(4, 4)
+    assert len(big) > len(small)
+    blob = b"a" + small + b"b" + big + b"c"
+    assert _carve_largest_png(blob) == big
+
+
+def test_affinity_png_target_writes_carved_blob(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    png = _make_png_bytes(2, 2)
+    ctx = make_ctx("design.afphoto")
+    src = ctx.work_dir / "design.afphoto"
+    src.write_bytes(b"AFFINITY" + png + b"tail")
+    result = RenderPngHandler().run(ctx, src)
+    out = Path(result.outputs[0])
+    assert out.name == "design.png"
+    assert out.read_bytes() == png  # carved preview written verbatim
+
+
+def test_affinity_jpg_target_converts_carved_blob(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_magick(monkeypatch)
+    captured: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(argv)
+        Path(argv[-1]).write_bytes(b"\xff\xd8\xff")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    png = _make_png_bytes(2, 2)
+    ctx = make_ctx("design.afphoto")
+    src = ctx.work_dir / "design.afphoto"
+    src.write_bytes(b"AFFINITY" + png + b"tail")
+    result = RenderJpgHandler().run(ctx, src)
+    assert result.ok
+    argv = captured[0]
+    assert Path(argv[1]).name == "design.preview.png"  # carved PNG handed to convert
+    assert "-flatten" in argv and "white" in argv
+    assert argv[-1].endswith("design.jpg")
+
+
+def test_affinity_no_preview_raises(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = make_ctx("empty.afphoto")
+    src = ctx.work_dir / "empty.afphoto"
+    src.write_bytes(b"no embedded png whatsoever")
+    with pytest.raises(RenderError, match="no embedded preview"):
+        RenderPngHandler().run(ctx, src)
+
+
+def test_dir_walk_mixed_f4_formats_skips_txt(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1 composition: a.tiff + b.pdf + c.svg + notes.txt → three render, txt skipped."""
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in ("rsvg-convert", "magick", "convert") else None,
+    )
+    captured: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(argv)
+        # SVG PNG path writes via rsvg -o <out>; others write argv[-1].
+        out = argv[argv.index("-o") + 1] if "-o" in argv else argv[-1]
+        Path(out).write_bytes(b"\x89PNG")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ctx = make_ctx("Album", is_dir=True)
+    src_dir = ctx.work_dir / "src" / "Album"
+    src_dir.mkdir(parents=True)
+    (src_dir / "a.tiff").write_bytes(b"II*\x00")
+    (src_dir / "b.pdf").write_bytes(b"%PDF")
+    (src_dir / "c.svg").write_text("<svg/>")
+    (src_dir / "notes.txt").write_text("hi")
+
+    result = RenderPngHandler().run(ctx, src_dir)
+    assert result.ok
+    out_root = ctx.output_dir()
+    rels = sorted(Path(o).relative_to(out_root).as_posix() for o in result.outputs)
+    assert rels == ["a.png", "b.png", "c.png"]
+    assert result.message == "rendered 3 of 3 files"

@@ -29,6 +29,19 @@ PSD ships out of the box (CONTEXT.md §7): ``in.psd[0]`` selects Photoshop's
 flattened composite. Camera raws (CR2/CR3/NEF/ARW/DNG/RAF/ORF/RW2/PEF/SRW) ship
 via the two-stage libraw pipeline (CONTEXT.md §7, F2).
 
+F4 (M8) adds more "no-preview" source types:
+
+* **convert-native raster** (TIFF/TIF, BMP, GIF, ICO, TGA, DDS, XCF, JP2/J2K/
+  JPC/JPF, HEIC/HEIF/HIF, AVIF, WEBP): ``convert "src[0]" out`` — one stage.
+* **vector/page** (PDF, AI, EPS, PS): same, but ``-density 150`` BEFORE the
+  input for crisp rasterization (policy.xml unlocks the coders).
+* **SVG/SVGZ**: ImageMagick has no SVG delegate, so ``rsvg-convert`` is used —
+  PNG directly, JPG via an ``rsvg-convert | convert`` pipe.
+* **Affinity** (.afphoto/.afdesign/.afpub/.aftemplate/.af): Serif's proprietary
+  formats can't be read by IM; we carve the **embedded PNG preview** (largest
+  PNG blob in the file). This is a low-res preview, not a full render, and we
+  raise if no embedded PNG is present. CorelDraw/EMF remain unsupported.
+
 Directory-level render (F1)
 ---------------------------
 Both handlers also accept a **directory** as the source. ``can_handle`` returns
@@ -58,6 +71,7 @@ a single file only when its extension is registered. ``run`` then:
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -91,6 +105,57 @@ RAW_EXTS: tuple[str, ...] = (
     "pef",
     "srw",
 )
+
+# Raster source types ImageMagick (IM6, our image) reads natively at runtime
+# with the shipped policy.xml — a single `convert "src[0]" out` does it. The
+# ``[0]`` selector picks the first frame/page (multi-page TIFF, animated GIF,
+# multi-image ICO) so we always emit one still image.
+RASTER_EXTS: tuple[str, ...] = (
+    "tiff",
+    "tif",
+    "bmp",
+    "gif",
+    "ico",
+    "tga",
+    "dds",
+    "xcf",
+    "jp2",
+    "j2k",
+    "jpc",
+    "jpf",
+    "heic",
+    "heif",
+    "hif",
+    "avif",
+    "webp",
+)
+
+# Vector / page source types — same convert pipeline but with ``-density 150``
+# BEFORE the input so Ghostscript/IM rasterizes pages at a crisp resolution
+# (PDF/PS/EPS/AI are vector; the default 72 dpi looks blurry). policy.xml
+# unlocks the PDF/PS/EPS coders at runtime.
+VECTOR_PAGE_EXTS: tuple[str, ...] = (
+    "pdf",
+    "ai",
+    "eps",
+    "ps",
+)
+
+# Affinity (Serif) proprietary formats. ImageMagick cannot read these; the best
+# we can do offline is carve the embedded PNG preview Serif bakes in (low-res,
+# best-effort). Documented as a preview, not a full render.
+AFFINITY_EXTS: tuple[str, ...] = (
+    "afphoto",
+    "afdesign",
+    "afpub",
+    "aftemplate",
+    "af",
+)
+
+# PNG container markers used by the Affinity carver.
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+# IEND chunk: length(0) is implicit; the chunk type + its CRC terminate a PNG.
+_PNG_END = b"IEND\xaeB`\x82"
 
 
 def renderer(*exts: str) -> Callable[[Renderer], Renderer]:
@@ -129,6 +194,35 @@ def _run(argv: list[str]) -> None:
     )
     if proc.returncode != 0:
         raise RenderError(f"command failed ({Path(argv[0]).name}): {_snippet(proc.stderr)}")
+
+
+def _run_pipe(stage1: list[str], stage2: list[str]) -> None:
+    """Pipe ``stage1`` stdout into ``stage2`` stdin (no shell); raise on failure.
+
+    Used by the SVG renderer to feed ``rsvg-convert``'s PNG output straight into
+    ``convert`` for the JPG target, so no intermediate file is needed.
+    """
+    p1 = subprocess.run(  # noqa: S603 - argv built from controlled parts
+        stage1,
+        capture_output=True,
+        timeout=_SUBPROC_TIMEOUT,
+    )
+    if p1.returncode != 0:
+        raise RenderError(
+            f"command failed ({Path(stage1[0]).name}): "
+            f"{_snippet(p1.stderr.decode(errors='replace'))}"
+        )
+    p2 = subprocess.run(  # noqa: S603 - argv built from controlled parts
+        stage2,
+        input=p1.stdout,
+        capture_output=True,
+        timeout=_SUBPROC_TIMEOUT,
+    )
+    if p2.returncode != 0:
+        raise RenderError(
+            f"command failed ({Path(stage2[0]).name}): "
+            f"{_snippet(p2.stderr.decode(errors='replace'))}"
+        )
 
 
 @renderer("psd")
@@ -208,6 +302,117 @@ def _render_raw(src: Path, out: Path, fmt: str, scratch: Path) -> None:
         _run(argv)
     finally:
         tiff.unlink(missing_ok=True)
+
+
+def _convert_image(binary: str, source: str, out: Path, fmt: str, *, density: bool) -> None:
+    """Run a single ImageMagick ``convert`` for a raster or vector source.
+
+    ``source`` is the IM input spec (already ``"<path>[0]"``). For PNG we keep
+    any alpha; for JPG we flatten onto white. ``density`` adds ``-density 150``
+    BEFORE the input for crisp vector/page rasterization.
+    """
+    argv = [binary]
+    if density:
+        argv += ["-density", "150"]
+    argv.append(source)
+    if fmt == "png":
+        # Raster: keep transparency; nothing extra needed for the still image.
+        argv.append(str(out))
+    else:
+        argv += ["-background", "white", "-flatten", "-quality", "90", str(out)]
+    _run(argv)
+
+
+@renderer(*RASTER_EXTS)
+def _render_raster(src: Path, out: Path, fmt: str, scratch: Path) -> None:
+    """convert-native raster (TIFF/HEIC/WEBP/JP2/BMP/GIF/…) → PNG/JPG (one stage).
+
+    ``[0]`` selects the first frame/page so multi-page TIFFs, animated GIFs and
+    multi-image ICOs collapse to a single still.
+    """
+    binary = magick_binary()
+    _convert_image(binary, f"{src}[0]", out, fmt, density=False)
+
+
+@renderer(*VECTOR_PAGE_EXTS)
+def _render_vector_page(src: Path, out: Path, fmt: str, scratch: Path) -> None:
+    """PDF/AI/EPS/PS → PNG/JPG via ``convert -density 150 "src[0]"`` (one stage).
+
+    ``-density 150`` BEFORE the input rasterizes the (vector) page crisply;
+    ``[0]`` takes the first page. policy.xml unlocks the PDF/PS/EPS coders.
+    """
+    binary = magick_binary()
+    _convert_image(binary, f"{src}[0]", out, fmt, density=True)
+
+
+@renderer("svg", "svgz")
+def _render_svg(src: Path, out: Path, fmt: str, scratch: Path) -> None:
+    """SVG/SVGZ → PNG/JPG via ``rsvg-convert`` (IM has no SVG delegate).
+
+    PNG: ``rsvg-convert -o out src`` (rsvg outputs PNG natively, alpha kept).
+    JPG: ``rsvg-convert src`` piped into ``convert png:- -background white
+    -flatten -quality 90 out`` — a two-stage pipe, no intermediate file.
+    """
+    rsvg = shutil.which("rsvg-convert")
+    if rsvg is None:
+        raise RenderError("SVG renderer needs 'rsvg-convert' (install librsvg2-bin)")
+    if fmt == "png":
+        _run([rsvg, "-o", str(out), str(src)])
+        return
+    binary = magick_binary()
+    _run_pipe(
+        [rsvg, str(src)],
+        [binary, "png:-", "-background", "white", "-flatten", "-quality", "90", str(out)],
+    )
+
+
+def _carve_largest_png(data: bytes) -> bytes | None:
+    """Return the largest embedded PNG blob in ``data`` (signature..IEND+CRC), or None.
+
+    Affinity files (.afphoto/.afdesign/…) embed a PNG preview; we scan for every
+    ``\\x89PNG…IEND\\xaeB`\\x82`` blob and return the biggest (best/largest preview).
+    """
+    largest: bytes | None = None
+    start = data.find(_PNG_MAGIC)
+    while start != -1:
+        end = data.find(_PNG_END, start)
+        if end == -1:
+            break
+        blob = data[start : end + len(_PNG_END)]
+        if largest is None or len(blob) > len(largest):
+            largest = blob
+        # Continue scanning after this blob's end for further PNGs.
+        start = data.find(_PNG_MAGIC, end + len(_PNG_END))
+    return largest
+
+
+@renderer(*AFFINITY_EXTS)
+def _render_affinity(src: Path, out: Path, fmt: str, scratch: Path) -> None:
+    """Affinity (Serif) → PNG/JPG by carving the embedded PNG preview (best-effort).
+
+    Serif's proprietary formats can't be read by ImageMagick. We extract the
+    embedded PNG preview (the largest PNG blob in the file) — this is a
+    **preview**, not a full render: low-res, whatever Serif baked in. Raises
+    :class:`RenderError` if no embedded PNG is found (we never fabricate one).
+    """
+    blob = _carve_largest_png(src.read_bytes())
+    if blob is None:
+        raise RenderError("no embedded preview in Affinity file")
+    logging.getLogger("ncpowertools.render").info(
+        "using embedded Affinity preview (not a full render)",
+        extra={"src": src.name, "preview_bytes": len(blob)},
+    )
+    if fmt == "png":
+        out.write_bytes(blob)
+        return
+    # JPG: hand the carved PNG to ImageMagick (write it to scratch, then convert).
+    binary = magick_binary()
+    tmp = scratch / f"{src.stem}.preview.png"
+    tmp.write_bytes(blob)
+    try:
+        _run([binary, str(tmp), "-background", "white", "-flatten", "-quality", "90", str(out)])
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _src_ext(name: str) -> str:

@@ -28,12 +28,35 @@ trigger tag** to mark it done and make it re-runnable. Temp files are cleaned.
 | `extract`    | Decompress an archive (zip, rar, 7z, tar, tar.gz/tgz, tar.bz2/xz, gz) into a new subfolder |
 | `zip`        | Compress the tagged file/folder → `<name>.zip`                          |
 | `rar`        | Compress → `.rar` (opt-in build; default OFF — use `zip`/`7z` instead)  |
-| `render-png` | Render/convert → PNG, preserving transparency (PSD + camera RAW)        |
-| `render`     | Render/convert → JPG, flattened onto white (PSD + camera RAW)            |
+| `render-png` | Render/convert → PNG, preserving transparency (PSD, camera RAW, TIFF, PDF/AI/EPS/PS, HEIC/AVIF/WEBP, JP2, SVG, BMP/GIF/ICO/TGA/DDS/XCF, Affinity preview) |
+| `render`     | Render/convert → JPG, flattened onto white (same source types as `render-png`) |
 
 The map is configurable via `TAG_ACTIONS`. `render`/`render-png` use an
-extensible renderer registry — adding a source type (SVG, TIFF, HEIC, AI, …) is
-a few lines (see [How to extend](#how-to-extend)).
+extensible renderer registry — adding a source type is a few lines (see
+[How to extend](#how-to-extend)).
+
+### Supported render source types
+
+`render` (→ JPG) and `render-png` (→ PNG) accept many "files Nextcloud can't
+preview", all via the same registry (so they also work on folders — see below):
+
+| Family | Extensions | How |
+|--------|------------|-----|
+| Photoshop | `psd` | `convert "in.psd[0]"` (flattened composite) |
+| Camera RAW | `cr2` `cr3` `nef` `arw` `dng` `raf` `orf` `rw2` `pef` `srw` | two-stage `dcraw_emu` → TIFF → `convert` (camera WB, sRGB, orientation) |
+| Raster (IM-native) | `tiff` `tif` `bmp` `gif` `ico` `tga` `dds` `xcf` `jp2` `j2k` `jpc` `jpf` `heic` `heif` `hif` `avif` `webp` | `convert "in[0]"` (first frame/page) |
+| Vector / page | `pdf` `ai` `eps` `ps` | `convert -density 150 "in[0]"` (crisp rasterization) |
+| SVG | `svg` `svgz` | `rsvg-convert` (PNG direct; JPG via `rsvg-convert \| convert`) |
+| Affinity (best-effort) | `afphoto` `afdesign` `afpub` `aftemplate` `af` | **embedded-PNG preview carve** — see caveat below |
+
+> **Affinity = best-effort embedded preview, not a full render.** Serif's
+> `.afphoto`/`.afdesign`/`.afpub`/… formats are proprietary and ImageMagick
+> cannot read them. The worker carves out the **embedded PNG preview** Serif
+> bakes into the file (the largest PNG blob) — that's whatever low-resolution
+> thumbnail Serif chose to store, **not** a high-fidelity render. If the file
+> has no embedded PNG, the render fails (we never fabricate one).
+>
+> **Unsupported:** CorelDraw (`.cdr`) and `.emf`/`.wmf` are not supported.
 
 **Camera RAW** files (`CR2`/`CR3`, `NEF`, `ARW`, `DNG`, `RAF`, `ORF`, `RW2`,
 `PEF`, `SRW`) render to **JPG via `render`** or **PNG via `render-png`** — no
@@ -42,8 +65,9 @@ ImageMagick pipeline (camera white balance, sRGB, orientation preserved), so
 embedded EXIF orientation is honoured. Works on single files **and folders**.
 
 **Folders are supported.** Tagging a **directory** with `render` / `render-png`
-recursively renders **every file below it** whose type is registered (PSD and
-camera RAW today), writing each output **beside its source** with the subtree mirrored
+recursively renders **every file below it** whose type is registered (PSD,
+camera RAW, TIFF, PDF/AI/EPS/PS, HEIC/AVIF/WEBP, JP2, SVG, BMP/GIF/ICO/TGA/DDS/
+XCF and Affinity previews), writing each output **beside its source** with the subtree mirrored
 (`Album/a.psd` → `Album/a.png`, `Album/sub/b.psd` → `Album/sub/b.png`).
 Non-renderable files (e.g. `notes.txt`) are skipped; a folder with nothing to
 render is treated as success (the trigger tag is removed). The number of files
@@ -69,8 +93,9 @@ Isolation is the whole point of this design:
   (`MAX_UNCOMPRESSED_SIZE` + `MAX_FILES`, enforced before and while extracting;
   partial output is cleaned on abort).
 - **ImageMagick hardening** via a custom `policy.xml`: only the coders we render
-  (PSD/PDF/PS/EPS/AI) are re-enabled, the classic RCE vectors (MVG/MSL/URL/HTTP
-  delegates) stay disabled, and resource limits cap memory/disk/time.
+  (PSD/PDF/PS/EPS/AI; HEIC/WEBP/JP2/TIFF/etc. are native reads) are re-enabled,
+  the classic RCE vectors (MVG/MSL/URL/HTTP delegates) stay disabled, and
+  resource limits cap memory/disk/time.
 - **Never deletes originals**; idempotent via a per-file lock + tag removal only
   after a verified upload.
 

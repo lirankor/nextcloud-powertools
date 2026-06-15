@@ -85,7 +85,27 @@ Questions to resolve BEFORE building (ask the owner at research time):
 
 ---
 
-## F4 — More render source types (afphoto, TIFF, AI/EPS/PDF, HEIC, SVG, …)  🟡 researching (directory-level)
+## F4 — More render source types (afphoto, TIFF, AI/EPS/PDF, HEIC, SVG, …)  ✅ done (directory-level)
+**Requested:** 2026-06-15. **Shipped:** 2026-06-15 (M8).
+Extended the render registry beyond PSD + raw to many more "files Nextcloud can't preview".
+Registered (all compose with the F1 directory walk automatically):
+- **convert-native raster:** `tiff`/`tif`, `bmp`, `gif`, `ico`, `tga`, `dds`, `xcf`, `jp2`/`j2k`/
+  `jpc`/`jpf`, `heic`/`heif`/`hif`, `avif`, `webp` — `convert "src[0]" out` (PNG keeps alpha; JPG
+  `-background white -flatten -quality 90`). `[0]` picks the first frame/page.
+- **vector/page:** `pdf`, `ai`, `eps`, `ps` — same but `-density 150` BEFORE the input for crisp
+  rasterization (policy.xml unlocks the coders).
+- **SVG:** `svg`, `svgz` — `rsvg-convert` (IM has no SVG delegate): PNG via `rsvg-convert -o`,
+  JPG via `rsvg-convert src | convert png:- -background white -flatten -quality 90 out`.
+- **Affinity (best-effort):** `afphoto`, `afdesign`, `afpub`, `aftemplate`, `af` — pure-Python
+  carver extracts the **largest embedded PNG preview** (Serif bakes one in); PNG target writes it
+  verbatim, JPG target converts it. **Low-res preview, NOT a full render**; raises if no embedded
+  PNG. CorelDraw/EMF remain unsupported.
+
+**ZERO new apt packages** (HEIC/WEBP/JP2/ghostscript/librsvg already in the image). Only change to
+ops: `rsvg-convert` added to selftest `OPTIONAL_TOOLS`. Verified via dockerized smoke (TIFF, PDF,
+HEIC, WEBP, SVG through the real handler + the Affinity carver on a synthetic embedded-PNG file).
+
+### Original notes
 **Requested:** 2026-06-15.
 Extend the render registry beyond PSD + raw so more "files Nextcloud can't preview" convert to a
 viewable PNG/JPG. Requested examples: **`.afphoto`** (Affinity Photo), **`.tiff`**, "and other
