@@ -2,14 +2,53 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
+from pathlib import Path
+
 import httpx
 import pytest
 
 from ncpowertools.config import Settings
+from ncpowertools.handlers.base import HandlerContext
+from ncpowertools.models import FileRef
 from ncpowertools.nextcloud import NextcloudClient
 
 BASE_URL = "https://cloud.example.com"
 USER = "powertools"
+
+
+@pytest.fixture
+def make_ctx(tmp_path: Path) -> Callable[..., HandlerContext]:
+    """Factory building a HandlerContext for a given source name.
+
+    Usage: ``ctx = make_ctx("foo.zip", is_dir=False, max_files=..., ...)``.
+    The work_dir is a unique tmp subdir per context.
+    """
+    counter = {"n": 0}
+
+    def _make(
+        name: str,
+        *,
+        is_dir: bool = False,
+        fileid: int = 1,
+        max_uncompressed_size: int = 2_147_483_648,
+        max_files: int = 10_000,
+        enable_rar: bool = False,
+    ) -> HandlerContext:
+        counter["n"] += 1
+        work = tmp_path / f"work{counter['n']}"
+        work.mkdir(parents=True, exist_ok=True)
+        return HandlerContext(
+            work_dir=work,
+            src=FileRef(fileid=fileid, path=name, is_dir=is_dir, name=name),
+            max_uncompressed_size=max_uncompressed_size,
+            max_files=max_files,
+            enable_rar=enable_rar,
+            logger=logging.getLogger("test.handler"),
+        )
+
+    return _make
 
 
 @pytest.fixture

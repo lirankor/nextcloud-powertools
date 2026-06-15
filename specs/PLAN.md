@@ -47,7 +47,7 @@ HEIC, AI, …) or a new tag is a few lines.
 | # | Name | Status | Summary |
 |---|------|--------|---------|
 | M1 | Scaffold + config + Nextcloud client core | ✅ done | Package layout, env config, structured logging, `NextcloudClient` (capabilities/version, GET/PUT/MKCOL, fileid→path REPORT, systemtags list/create, assign/remove relation, systemtag-search REPORT, OCS notify). Mocked-httpx unit tests. |
-| M2 | Action handlers + registry | ⬜ todo | Handler registry (tag→action), archive extract w/ zip-slip + zip-bomb guards, zip compress, rar compress (opt-in), render registry (PSD→PNG/JPG). Unit tests incl. malicious-archive fixtures; binary-backed handlers via subprocess + dockerized smoke. |
+| M2 | Action handlers + registry | ✅ done | Handler registry (tag→action), archive extract w/ zip-slip + zip-bomb guards, zip compress, rar compress (opt-in), render registry (PSD→PNG/JPG). Unit tests incl. malicious-archive fixtures; binary-backed handlers via subprocess + dockerized smoke. |
 | M3 | Orchestration: trigger → pipeline | ⬜ todo | Pipeline tying client+handlers; per-file lock + idempotency; never-delete-original; error tag + optional notify. Webhook server (constant-time shared-secret validation, payload parse) + polling loop (systemtag search). Entrypoint, graceful shutdown. Unit + smoke. |
 | M4 | Packaging & ops | ⬜ todo | Dockerfile (multi-stage slim non-root, tools, policy.xml, RAR build arg), docker-compose.yml (env, resource limits, cap_drop, restart), GH Actions multi-arch → ghcr, webhook setup script + docs, README, .env.example, LICENSE, .dockerignore/.gitignore. Local buildx smoke. |
 
@@ -66,3 +66,4 @@ Supervisor reviews each report, updates this plan, carries gotchas forward.
 ## Change log
 - _(init)_ Specs written from 3-agent research fan-out (webhooks, WebDAV/OCS, ImageMagick+CI).
 - **M1 ✅** — Scaffold + pyproject (py3.12, pinned deps), config (`Settings` + `TAG_ACTIONS` dual-form parser), JSON logging, models, typed errors, `webdav_xml` build/parse, `NextcloudClient` (all WebDAV/OCS methods per CONTEXT.md), argparse CLI (`run|poll-once|selftest|list-tags`; selftest splits tool-check from NC-check). 40 tests, ruff+mypy clean.
+- **M2 ✅** — `handlers/base.py` (`Handler` Protocol + `HandlerContext` w/ `output_dir()`), registry `ACTIONS`/`resolve()`, `archives.py` extract (zip/tar/tgz/bz2/gz stdlib + 7z/unrar subprocess) with zip-slip + zip-bomb + symlink-escape guards and partial-cleanup, `compress.py` zip (deterministic) + rar (gated) + 7z, `render.py` `@renderer` registry shipping PSD→PNG/JPG. 92 tests (52 new) incl. malicious fixtures + subprocess-mock argv asserts; real 7z/rar/magick tests skip-if-absent. ruff+mypy clean.
