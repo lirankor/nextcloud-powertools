@@ -28,16 +28,22 @@ trigger tag** to mark it done and make it re-runnable. Temp files are cleaned.
 | `extract`    | Decompress an archive (zip, rar, 7z, tar, tar.gz/tgz, tar.bz2/xz, gz) into a new subfolder |
 | `zip`        | Compress the tagged file/folder → `<name>.zip`                          |
 | `rar`        | Compress → `.rar` (opt-in build; default OFF — use `zip`/`7z` instead)  |
-| `render-png` | Render/convert → PNG, preserving transparency (ships PSD)               |
-| `render`     | Render/convert → JPG, flattened onto white (ships PSD)                   |
+| `render-png` | Render/convert → PNG, preserving transparency (PSD + camera RAW)        |
+| `render`     | Render/convert → JPG, flattened onto white (PSD + camera RAW)            |
 
 The map is configurable via `TAG_ACTIONS`. `render`/`render-png` use an
 extensible renderer registry — adding a source type (SVG, TIFF, HEIC, AI, …) is
 a few lines (see [How to extend](#how-to-extend)).
 
+**Camera RAW** files (`CR2`/`CR3`, `NEF`, `ARW`, `DNG`, `RAF`, `ORF`, `RW2`,
+`PEF`, `SRW`) render to **JPG via `render`** or **PNG via `render-png`** — no
+separate tag. They decode through a two-stage `libraw` (`dcraw_emu`) → TIFF →
+ImageMagick pipeline (camera white balance, sRGB, orientation preserved), so
+embedded EXIF orientation is honoured. Works on single files **and folders**.
+
 **Folders are supported.** Tagging a **directory** with `render` / `render-png`
-recursively renders **every file below it** whose type is registered (PSD
-today), writing each output **beside its source** with the subtree mirrored
+recursively renders **every file below it** whose type is registered (PSD and
+camera RAW today), writing each output **beside its source** with the subtree mirrored
 (`Album/a.psd` → `Album/a.png`, `Album/sub/b.psd` → `Album/sub/b.png`).
 Non-renderable files (e.g. `notes.txt`) are skipped; a folder with nothing to
 render is treated as success (the trigger tag is removed). The number of files
@@ -196,16 +202,23 @@ Default `TAG_ACTIONS` (set via env as **JSON**, not the compact form):
 
 **Add a render source type:** register a renderer in
 `src/ncpowertools/handlers/render.py` with the `@renderer` decorator. A renderer
-maps `(src, out, target_fmt)` → an ImageMagick argv list. Example for SVG (the
-`librsvg2-bin` delegate is already in the image; TIFF/HEIC similar):
+is a callable `render(src, out, fmt, scratch) -> None` that performs the **full**
+conversion, running each subprocess stage via the shared `_run()` helper (which
+captures stderr and raises `RenderError` on failure). `scratch` is a writable
+temp dir for intermediates (the caller cleans it). Single-stage types (SVG, …)
+issue one ImageMagick command; multi-stage types (camera RAW: `dcraw_emu` → TIFF
+→ ImageMagick) chain `_run()` calls. Example for SVG (the `librsvg2-bin`
+delegate is already in the image; TIFF/HEIC similar):
 
 ```python
 @renderer("svg")
-def _render_svg(src: Path, out: Path, fmt: str) -> list[str]:
+def _render_svg(src: Path, out: Path, fmt: str, scratch: Path) -> None:
     binary = magick_binary()              # "magick" or IM6 "convert"
-    if fmt == "png":
-        return [binary, "-background", "none", str(src), str(out)]
-    return [binary, "-background", "white", "-flatten", str(src), str(out)]
+    bg = "none" if fmt == "png" else "white"
+    argv = [binary, "-background", bg, str(src)]
+    if fmt == "jpg":
+        argv.append("-flatten")
+    _run(argv + [str(out)])
 ```
 
 Then both `render-png` (PNG) and `render` (JPG) work for that extension —

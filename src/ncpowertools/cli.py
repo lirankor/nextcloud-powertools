@@ -26,7 +26,7 @@ log = get_logger("cli")
 
 # CLI tools the worker may shell out to (M2). selftest reports presence.
 REQUIRED_TOOLS = ["unzip", "zip", "tar", "gzip"]
-OPTIONAL_TOOLS = ["7z", "7za", "unrar", "rar", "magick", "convert"]
+OPTIONAL_TOOLS = ["7z", "7za", "unrar", "rar", "magick", "convert", "dcraw_emu"]
 
 
 def build_parser() -> argparse.ArgumentParser:

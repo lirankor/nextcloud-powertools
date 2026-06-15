@@ -13,6 +13,7 @@ from ncpowertools.errors import HandlerError, RenderError
 from ncpowertools.handlers import resolve
 from ncpowertools.handlers.base import HandlerContext
 from ncpowertools.handlers.render import (
+    RAW_EXTS,
     RENDERERS,
     RenderJpgHandler,
     RenderPngHandler,
@@ -40,8 +41,8 @@ def test_registry_extensible_a_few_lines() -> None:
     """Adding a source type is a decorator + a function (the extensibility bullet)."""
 
     @renderer("dummyext")
-    def _dummy(src: Path, out: Path, fmt: str) -> list[str]:
-        return ["true", str(src), str(out)]
+    def _dummy(src: Path, out: Path, fmt: str, scratch: Path) -> None:
+        out.write_bytes(b"x")
 
     try:
         assert resolve_renderer("dummyext") is _dummy
@@ -159,7 +160,7 @@ def test_render_subprocess_failure_raises(
         return subprocess.CompletedProcess(argv, 1, "", "convert: bad coder")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    with pytest.raises(RenderError, match="render failed"):
+    with pytest.raises(RenderError, match="command failed"):
         RenderPngHandler().run(ctx, src)
 
 
@@ -325,15 +326,17 @@ def test_dir_walk_renders_a_dummy_registered_ext(
 ) -> None:
     """Register a new source ext → a dir containing it renders (extensibility)."""
 
+    from ncpowertools.handlers import render as render_mod
+
     @renderer("foobar")
-    def _foo(src: Path, out: Path, fmt: str) -> list[str]:
-        return ["true", str(src), str(out)]
+    def _foo(src: Path, out: Path, fmt: str, scratch: Path) -> None:
+        render_mod._run(["true", str(src), str(out)])
+        out.write_bytes(b"x")
 
     captured: list[list[str]] = []
 
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         captured.append(argv)
-        Path(argv[-1]).write_bytes(b"x")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -349,6 +352,196 @@ def test_dir_walk_renders_a_dummy_registered_ext(
         assert captured[0][0] == "true"
     finally:
         RENDERERS.pop("foobar", None)
+
+
+# --- camera RAW two-stage pipeline (F2) ---------------------------------------
+
+
+def test_raw_exts_all_registered() -> None:
+    """Every camera-raw ext routes through a renderer (registry test)."""
+    for ext in RAW_EXTS:
+        assert ext in RENDERERS
+    # cr2 + a couple others are present (sanity).
+    assert {"cr2", "cr3", "nef", "arw", "dng"} <= set(RENDERERS)
+
+
+def _patch_raw_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pretend dcraw_emu + convert are both on PATH."""
+
+    def which(name: str) -> str | None:
+        if name == "dcraw_emu":
+            return "/usr/bin/dcraw_emu"
+        if name in ("magick", "convert"):
+            return "/usr/bin/convert"
+        return None
+
+    monkeypatch.setattr(shutil, "which", which)
+
+
+def _raw_capture(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Patch tools + subprocess; record argv; emulate dcraw writing the -Z TIFF
+    and convert writing its final output."""
+    _patch_raw_tools(monkeypatch)
+    captured: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(list(argv))
+        binary = Path(argv[0]).name
+        if binary == "dcraw_emu":
+            # honour the explicit -Z output path
+            zi = argv.index("-Z")
+            Path(argv[zi + 1]).write_bytes(b"II*\x00")  # little-endian TIFF magic
+        else:
+            Path(argv[-1]).write_bytes(b"\xff\xd8\xff")  # final image
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return captured
+
+
+def test_raw_jpg_two_stage_commands(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _raw_capture(monkeypatch)
+    ctx = make_ctx("shot.cr2")
+    src = ctx.work_dir / "shot.cr2"
+    src.write_bytes(b"\x00raw")
+
+    result = RenderJpgHandler().run(ctx, src)
+    assert result.ok
+    assert len(captured) == 2  # exactly two stages, in order
+
+    # Stage 1: dcraw_emu with the exact flags, -Z to a scratch path (not beside src).
+    stage1 = captured[0]
+    assert Path(stage1[0]).name == "dcraw_emu"
+    assert stage1[1:8] == ["-w", "-o", "1", "-q", "3", "-T", "-Z"]
+    tiff_path = Path(stage1[8])
+    assert stage1[9] == str(src)  # source is the LAST arg
+    # TIFF lives under the handler scratch dir, NOT beside the source.
+    assert "scratch" in tiff_path.parts
+    assert tiff_path.parent != src.parent
+    assert tiff_path.suffix == ".tiff"
+
+    # Stage 2: convert TIFF → jpg with -auto-orient -colorspace sRGB -depth 8 -quality 90.
+    stage2 = captured[1]
+    assert Path(stage2[0]).name == "convert"
+    assert stage2[1] == str(tiff_path)
+    assert "-auto-orient" in stage2
+    assert stage2[stage2.index("-colorspace") + 1] == "sRGB"
+    assert stage2[stage2.index("-depth") + 1] == "8"
+    assert stage2[stage2.index("-quality") + 1] == "90"
+    assert stage2[-1].endswith("shot.jpg")
+
+    # The temp TIFF was created under scratch and then cleaned.
+    assert not tiff_path.exists()
+
+
+def test_raw_png_two_stage_commands(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _raw_capture(monkeypatch)
+    ctx = make_ctx("shot.nef")
+    src = ctx.work_dir / "shot.nef"
+    src.write_bytes(b"\x00raw")
+
+    result = RenderPngHandler().run(ctx, src)
+    assert result.ok
+    assert len(captured) == 2
+
+    stage1 = captured[0]
+    assert Path(stage1[0]).name == "dcraw_emu"
+    assert stage1[1:8] == ["-w", "-o", "1", "-q", "3", "-T", "-Z"]
+    tiff_path = Path(stage1[8])
+    assert "scratch" in tiff_path.parts
+
+    stage2 = captured[1]
+    assert Path(stage2[0]).name == "convert"
+    assert "-auto-orient" in stage2
+    assert stage2[stage2.index("-colorspace") + 1] == "sRGB"
+    assert stage2[stage2.index("-depth") + 1] == "8"
+    # PNG path does NOT pass -quality (that's JPG-only).
+    assert "-quality" not in stage2
+    assert stage2[-1].endswith("shot.png")
+    assert not tiff_path.exists()
+
+
+def test_raw_no_decoder_raises(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # magick present but dcraw_emu absent.
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/usr/bin/convert" if name == "convert" else None
+    )
+    ctx = make_ctx("shot.cr2")
+    src = ctx.work_dir / "shot.cr2"
+    src.write_bytes(b"\x00raw")
+    with pytest.raises(RenderError, match="raw decoder not available"):
+        RenderJpgHandler().run(ctx, src)
+
+
+def test_raw_tiff_cleaned_on_convert_failure(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If stage-2 convert fails, the scratch TIFF is still cleaned up."""
+    _patch_raw_tools(monkeypatch)
+    seen_tiff: dict[str, Path] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if Path(argv[0]).name == "dcraw_emu":
+            zi = argv.index("-Z")
+            tiff = Path(argv[zi + 1])
+            tiff.write_bytes(b"II*\x00")
+            seen_tiff["p"] = tiff
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", "convert: boom")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ctx = make_ctx("shot.cr2")
+    src = ctx.work_dir / "shot.cr2"
+    src.write_bytes(b"\x00raw")
+    with pytest.raises(RenderError, match="command failed"):
+        RenderJpgHandler().run(ctx, src)
+    assert not seen_tiff["p"].exists()  # TIFF cleaned even on failure
+
+
+def test_raw_routes_through_registry(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registered raw ext resolves to the raw renderer (same fn for all raws)."""
+    assert resolve_renderer("cr2") is resolve_renderer("dng")
+    assert resolve_renderer("arw") is resolve_renderer("CR3")  # case-insensitive
+
+
+def test_dir_walk_mixed_raw_and_psd_skips_txt(
+    make_ctx: CtxFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1 composition: a folder with a.cr2 + b.psd + notes.txt renders both, skips txt."""
+    _patch_raw_tools(monkeypatch)
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        binary = Path(argv[0]).name
+        if binary == "dcraw_emu":
+            zi = argv.index("-Z")
+            Path(argv[zi + 1]).write_bytes(b"II*\x00")
+        else:
+            Path(argv[-1]).write_bytes(b"\xff\xd8\xff")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    ctx = make_ctx("Album", is_dir=True)
+    src_dir = ctx.work_dir / "src" / "Album"
+    src_dir.mkdir(parents=True)
+    (src_dir / "a.cr2").write_bytes(b"\x00raw")
+    (src_dir / "b.psd").write_bytes(b"8BPS")
+    (src_dir / "notes.txt").write_text("hi")
+
+    result = RenderJpgHandler().run(ctx, src_dir)
+    assert result.ok
+    out_root = ctx.output_dir()
+    rels = sorted(Path(o).relative_to(out_root).as_posix() for o in result.outputs)
+    assert rels == ["a.jpg", "b.jpg"]  # raw + psd both rendered; txt skipped
+    assert result.message == "rendered 2 of 2 files"
 
 
 # --- real render (skipped on hosts without ImageMagick) -----------------------
@@ -410,3 +603,25 @@ def test_render_dir_two_level_psd_tree_real(make_ctx: CtxFactory) -> None:
     assert rels == ["a.png", "sub/b.png"]
     for o in result.outputs:
         assert Path(o).exists() and Path(o).stat().st_size > 0
+
+
+@pytest.mark.skipif(
+    shutil.which("dcraw_emu") is None
+    or (shutil.which("magick") is None and shutil.which("convert") is None),
+    reason="libraw (dcraw_emu) and/or ImageMagick not available",
+)
+def test_render_raw_real(make_ctx: CtxFactory, tmp_path: Path) -> None:
+    """Real two-stage raw render. Skipped on the mac (no libraw); covered by the
+    dockerized smoke. Needs a sample raw at NCPT_TEST_RAW (else skip)."""
+    import os
+
+    sample = os.environ.get("NCPT_TEST_RAW")
+    if not sample or not Path(sample).exists():
+        pytest.skip("set NCPT_TEST_RAW to a sample raw file to run this")
+    ctx = make_ctx(Path(sample).name)
+    src = ctx.work_dir / Path(sample).name
+    src.write_bytes(Path(sample).read_bytes())
+
+    result = RenderJpgHandler().run(ctx, src)
+    out = Path(result.outputs[0])
+    assert out.exists() and out.stat().st_size > 0

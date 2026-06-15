@@ -58,6 +58,7 @@ ENV PATH="/opt/venv/bin:${PATH}" \
 #   ghostscript                 -> PDF/PS/EPS/AI delegate for ImageMagick
 #   librsvg2-bin                -> SVG delegate (rsvg-convert) for extending render
 #   libheif1                    -> HEIC delegate
+#   libraw-bin                  -> dcraw_emu (camera RAW decode: CR2/CR3/NEF/ARW/DNG/…)
 #   p7zip-full                  -> 7z (extract .7z + the open compress alternative)
 #   unrar-free                  -> unrar (extract .rar; see ENABLE_RAR note re: creation)
 #   zip/unzip/tar/gzip/xz-utils -> archive extract/compress
@@ -67,6 +68,7 @@ RUN apt-get update \
         ghostscript \
         librsvg2-bin \
         libheif1 \
+        libraw-bin \
         p7zip-full \
         unrar-free \
         zip \

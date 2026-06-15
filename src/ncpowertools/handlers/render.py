@@ -1,13 +1,24 @@
 """Render/convert handlers backed by an extensible renderer registry.
 
-A :class:`Renderer` maps ``(src_path, target_fmt)`` to a subprocess argv list
-that drives ImageMagick (``magick`` if present, else IM6 ``convert``). Renderers
+A :data:`Renderer` is a callable ``render(src, out, fmt, scratch) -> None`` that
+performs a **full** conversion of one source file to ``out`` in the target
+format (``"png"`` or ``"jpg"``), running whatever subprocess stage(s) it needs
+via the shared :func:`_run` helper. ``scratch`` is a writable directory the
+renderer may use for intermediate files (it is cleaned by the caller). Renderers
 are registered by lowercased **source** extension via the :func:`renderer`
 decorator, so adding a new source type (SVG, TIFF, HEIC, AI, …) is a few lines:
 
     @renderer("svg")
-    def _svg(src: Path, out: Path, fmt: str) -> list[str]:
-        return [magick_binary(), str(src), str(out)]
+    def _svg(src: Path, out: Path, fmt: str, scratch: Path) -> None:
+        binary = magick_binary()
+        bg = "none" if fmt == "png" else "white"
+        _run([binary, "-background", bg, str(src), str(out)])
+
+Single-stage renderers (PSD, SVG, …) just issue one ImageMagick command. Some
+source types need **multiple** stages: camera raws decode via ``dcraw_emu`` to a
+temp TIFF (in ``scratch``) which ImageMagick then converts to the final output —
+this two-stage form lives behind the same callable contract, so the directory
+walk and single-file paths drive raws and PSDs identically.
 
 Two handlers consume the registry:
 
@@ -15,7 +26,8 @@ Two handlers consume the registry:
 * ``render``     → target **JPG**, flattened onto white.
 
 PSD ships out of the box (CONTEXT.md §7): ``in.psd[0]`` selects Photoshop's
-flattened composite.
+flattened composite. Camera raws (CR2/CR3/NEF/ARW/DNG/RAF/ORF/RW2/PEF/SRW) ship
+via the two-stage libraw pipeline (CONTEXT.md §7, F2).
 
 Directory-level render (F1)
 ---------------------------
@@ -57,10 +69,28 @@ from .base import HandlerContext
 
 _SUBPROC_TIMEOUT = 300
 
-# A Renderer: (src, out, target_fmt) -> argv. target_fmt is "png" or "jpg".
-Renderer = Callable[[Path, Path, str], list[str]]
+# A Renderer performs the full conversion of `src` to `out` in `fmt`
+# ("png" or "jpg"), using `scratch` (a writable dir the caller cleans) for any
+# intermediate files. It runs subprocess stage(s) via `_run` and raises
+# RenderError on failure. Returns None (the output is the file it writes).
+Renderer = Callable[[Path, Path, str, Path], None]
 
 RENDERERS: dict[str, Renderer] = {}
+
+# Camera-raw source extensions, decoded via the two-stage libraw pipeline.
+# Start with the common set; extend by adding to this tuple.
+RAW_EXTS: tuple[str, ...] = (
+    "cr2",
+    "cr3",
+    "nef",
+    "arw",
+    "dng",
+    "raf",
+    "orf",
+    "rw2",
+    "pef",
+    "srw",
+)
 
 
 def renderer(*exts: str) -> Callable[[Renderer], Renderer]:
@@ -85,25 +115,99 @@ def magick_binary() -> str:
     return binary
 
 
+def _run(argv: list[str]) -> None:
+    """Run one conversion stage; raise :class:`RenderError` (with stderr) on failure.
+
+    Shared by every renderer so multi-stage pipelines (raw → TIFF → image) and
+    single-stage ones (PSD, SVG) report failures uniformly.
+    """
+    proc = subprocess.run(  # noqa: S603 - argv built from controlled parts
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=_SUBPROC_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        raise RenderError(f"command failed ({Path(argv[0]).name}): {_snippet(proc.stderr)}")
+
+
 @renderer("psd")
-def _render_psd(src: Path, out: Path, fmt: str) -> list[str]:
-    """PSD → PNG/JPG using the embedded flattened composite ``[0]``."""
+def _render_psd(src: Path, out: Path, fmt: str, scratch: Path) -> None:
+    """PSD → PNG/JPG using the embedded flattened composite ``[0]`` (one stage)."""
     binary = magick_binary()
     composite = f"{src}[0]"
     if fmt == "png":
         # Preserve transparency.
-        return [binary, composite, "-background", "none", str(out)]
+        _run([binary, composite, "-background", "none", str(out)])
+        return
     # JPG: flatten onto a white matte, decent quality.
-    return [
-        binary,
-        composite,
-        "-background",
-        "white",
-        "-flatten",
-        "-quality",
-        "90",
-        str(out),
-    ]
+    _run(
+        [
+            binary,
+            composite,
+            "-background",
+            "white",
+            "-flatten",
+            "-quality",
+            "90",
+            str(out),
+        ]
+    )
+
+
+@renderer(*RAW_EXTS)
+def _render_raw(src: Path, out: Path, fmt: str, scratch: Path) -> None:
+    """Camera RAW → PNG/JPG via a two-stage libraw pipeline.
+
+    Stage 1: ``dcraw_emu`` decodes the raw to a temp TIFF in ``scratch`` (the
+    explicit ``-Z`` output path is CRITICAL — without it dcraw_emu writes
+    ``<input>.tiff`` *beside the source*, which breaks read-only source dirs).
+    Stage 2: ImageMagick converts the TIFF to the final output.
+
+    This bypasses ImageMagick's policy.xml entirely (IM only ever opens the
+    decoded TIFF — TIFF/JPEG/PNG read/write are already allowed), so no raw
+    coder needs unlocking. The temp TIFF is always cleaned, even on failure.
+    """
+    decoder = shutil.which("dcraw_emu")
+    if decoder is None:
+        raise RenderError("raw decoder not available ('dcraw_emu' not on PATH; install libraw-bin)")
+    binary = magick_binary()
+
+    tiff = scratch / f"{src.stem}.decoded.tiff"
+    try:
+        # Stage 1: decode raw → TIFF (camera WB, sRGB, AHD demosaic, explicit -Z).
+        _run(
+            [
+                decoder,
+                "-w",
+                "-o",
+                "1",
+                "-q",
+                "3",
+                "-T",
+                "-Z",
+                str(tiff),
+                str(src),
+            ]
+        )
+        if not tiff.exists():
+            raise RenderError(f"raw decode produced no TIFF for {src.name}")
+        # Stage 2: TIFF → final image.
+        argv = [
+            binary,
+            str(tiff),
+            "-auto-orient",
+            "-colorspace",
+            "sRGB",
+            "-depth",
+            "8",
+        ]
+        if fmt == "jpg":
+            argv += ["-quality", "90"]
+        argv.append(str(out))
+        _run(argv)
+    finally:
+        tiff.unlink(missing_ok=True)
 
 
 def _src_ext(name: str) -> str:
@@ -148,7 +252,7 @@ class _RenderHandler:
         out_dir = ctx.output_dir()
         stem = ctx.src.name.rsplit(".", 1)[0] if "." in ctx.src.name else ctx.src.name
         out = out_dir / f"{stem}.{self.target_fmt}"
-        self._render_one(ext, src_local, out)
+        self._render_one(ctx, ext, src_local, out)
         ctx.logger.info(
             "rendered file",
             extra={"src": ctx.src.name, "target": self.target_fmt, "output": out.name},
@@ -186,7 +290,7 @@ class _RenderHandler:
             out = out_dir / rel.parent / f"{stem}.{self.target_fmt}"
             out.parent.mkdir(parents=True, exist_ok=True)
             try:
-                self._render_one(ext, src_file, out)
+                self._render_one(ctx, ext, src_file, out)
             except RenderError as exc:
                 failures += 1
                 ctx.logger.warning(
@@ -220,21 +324,19 @@ class _RenderHandler:
     # shared single-render primitive
     # ----------------------------------------------------------------- #
 
-    def _render_one(self, ext: str, src_file: Path, out: Path) -> None:
+    def _render_one(self, ctx: HandlerContext, ext: str, src_file: Path, out: Path) -> None:
         render = resolve_renderer(ext)
-        argv = render(src_file, out, self.target_fmt)
-        proc = subprocess.run(  # noqa: S603 - argv built from controlled parts
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=_SUBPROC_TIMEOUT,
-        )
-        if proc.returncode != 0:
-            raise RenderError(f"render failed ({ext}->{self.target_fmt}): {_snippet(proc.stderr)}")
+        scratch = ctx.work_dir / "scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            render(src_file, out, self.target_fmt, scratch)
+        except RenderError:
+            raise
+        except subprocess.TimeoutExpired as exc:
+            raise RenderError(f"render timed out ({ext}->{self.target_fmt}): {exc}") from exc
         if not out.exists():
             raise RenderError(
-                f"render produced no output ({ext}->{self.target_fmt}); "
-                f"stderr: {_snippet(proc.stderr)}"
+                f"render produced no output ({ext}->{self.target_fmt})"
             )
 
 

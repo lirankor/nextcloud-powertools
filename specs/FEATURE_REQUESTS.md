@@ -33,7 +33,18 @@ dockerized smoke on a 2-level PSD tree. ruff/mypy clean; existing tests green.
 
 ---
 
-## F2 — Raw photo → JPG  ⬜ backlog (directory-level)
+## F2 — Raw photo → JPG  ✅ done (directory-level)
+**Requested:** 2026-06-15. **Shipped:** 2026-06-15 (M6).
+Camera raws (CR2/CR3/NEF/ARW/DNG/RAF/ORF/RW2/PEF/SRW) render to JPG via `render` and PNG via
+`render-png` — no new tag; registered as renderers in the registry so the F1 directory walk works
+automatically. Two-stage pipeline: `dcraw_emu -w -o 1 -q 3 -T -Z <scratch>/decoded.tiff <src>` then
+`convert <tiff> -auto-orient -colorspace sRGB -depth 8 [-quality 90] <out>`. The renderer contract
+was generalized to a callable `render(src, out, fmt, scratch) -> None` (was: returns an argv list)
+so multi-stage conversions compose cleanly; PSD refactored to the new signature. `libraw-bin` added
+to the Dockerfile runtime; `dcraw_emu` added to selftest `OPTIONAL_TOOLS`. Bypasses ImageMagick
+policy.xml (IM only opens the decoded TIFF). Verified via dockerized smoke on a real Canon CR2.
+
+### Original notes
 **Requested:** 2026-06-15.
 Convert camera **raw** files to JPG. Should work on a single file AND a tagged directory (reuse
 F1's walk). Implemented as new entries in the **render registry** (`@renderer` decorator) so it
