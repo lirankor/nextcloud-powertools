@@ -133,9 +133,49 @@ def cmd_selftest(settings: Settings) -> int:
     finally:
         client.close()
 
+    # --- Phase 3: Immich reachability (F6, opt-in; separate failure domain) ---
+    if settings.ENABLE_IMMICH:
+        if not _immich_selftest(settings, report):
+            ok = False
+    else:
+        report.append("Immich: disabled (ENABLE_IMMICH=false) — immich tags ignored")
+
     report.append(f"== {'PASS' if ok else 'FAIL'} ==")
     print("\n".join(report))
     return 0 if ok else 1
+
+
+def _immich_selftest(settings: Settings, report: list[str]) -> bool:
+    """Probe the Immich server (ping/version/API-key/media-types). Returns ok.
+
+    Tolerant of Immich being unreachable — reports a FAIL line instead of
+    crashing (mirrors the NC two-phase pattern).
+    """
+    import httpx
+
+    from .immich import ImmichError, ImmichService
+
+    report.append("Immich (F6, opt-in) — ENABLED:")
+    report.append(f"  [..] IMMICH_URL='{settings.IMMICH_URL}', tag='{settings.IMMICH_TAG}'")
+    with ImmichService(settings) as immich:
+        try:
+            pong = immich.ping()
+            ver = immich.version()
+            report.append(
+                f"  [{'ok' if pong else '!!'}] reachable; version {ver}"
+                + ("" if pong else " (ping did not return pong)")
+            )
+            albums = immich.list_albums()  # 200 here = the API key works
+            report.append(f"  [ok] API key valid; {len(albums)} album(s) visible")
+            mt = immich.media_types()
+            report.append(
+                f"  [ok] accepted media: {len(mt['image'])} image + "
+                f"{len(mt['video'])} video types"
+            )
+            return True
+        except (ImmichError, httpx.HTTPError, OSError) as exc:
+            report.append(f"  [FAIL] Immich check failed: {exc}")
+            return False
 
 
 def cmd_list_tags(settings: Settings) -> int:

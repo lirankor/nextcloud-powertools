@@ -16,6 +16,7 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING
 
+from .config import immich_album_from_tag, is_immich_tag
 from .errors import NcApiError
 from .logging import get_logger
 from .models import TagEvent
@@ -40,6 +41,8 @@ class Poller:
     def sweep(self) -> int:
         """Run one pass over all configured trigger tags. Returns files seen."""
         seen = 0
+        # Fixed-tag loop: every statically-mapped TAG_ACTIONS entry.
+        seen_tagids: set[int] = set()
         for tag_name in self.settings.TAG_ACTIONS:
             try:
                 tag = self.client.ensure_tag(tag_name)
@@ -48,27 +51,65 @@ class Poller:
                 continue
             if tag.id is None:
                 continue
-            try:
-                refs = self.client.search_by_tag(tag.id, user=self.settings.TARGET_USER)
-            except NcApiError as exc:
-                log.warning("poll: search failed", extra={"tag": tag_name, "err": str(exc)})
-                continue
-            for ref in refs:
-                seen += 1
-                # Carry the FULL FileRef (with path + is_dir) that search_by_tag
-                # already resolved via the supported oc:systemtag filter, so the
-                # pipeline uses it directly and never re-resolves by fileid (the
-                # oc:fileid filter-rule NC ignores — the LIVE bug, M7).
-                event = TagEvent(
-                    uid=self.settings.TARGET_USER,
-                    fileids=[ref.fileid],
-                    tagids=[tag.id],
-                    files=[ref],
-                    raw={"source": "poller", "tag": tag_name},
-                )
-                self.pipeline.process(event)
+            seen_tagids.add(tag.id)
+            seen += self._sweep_tag(tag.id, tag_name, album=None)
+
+        # Immich (F6): parameterized/prefix trigger tags can't live in the static
+        # TAG_ACTIONS map, so when enabled we list ALL system tags and pick those
+        # named `<IMMICH_TAG>` (exact) or `<IMMICH_TAG>-<album>` (prefix). The
+        # album is parsed from the suffix and carried on the event. We dedupe
+        # against tag ids already swept above so a stray immich entry in
+        # TAG_ACTIONS doesn't double-process.
+        if self.settings.ENABLE_IMMICH:
+            seen += self._sweep_immich(seen_tagids)
+
         log.info("poll sweep done", extra={"files": seen})
         return seen
+
+    def _sweep_tag(self, tagid: int, tag_name: str, album: str | None) -> int:
+        """Search one tag id and feed each matching file into the pipeline."""
+        try:
+            refs = self.client.search_by_tag(tagid, user=self.settings.TARGET_USER)
+        except NcApiError as exc:
+            log.warning("poll: search failed", extra={"tag": tag_name, "err": str(exc)})
+            return 0
+        count = 0
+        for ref in refs:
+            count += 1
+            raw: dict[str, object] = {"source": "poller", "tag": tag_name}
+            if album is not None:
+                raw["immich_album"] = album
+            # Carry the FULL FileRef (with path + is_dir) that search_by_tag
+            # already resolved via the supported oc:systemtag filter, so the
+            # pipeline uses it directly and never re-resolves by fileid (the
+            # oc:fileid filter-rule NC ignores — the LIVE bug, M7).
+            event = TagEvent(
+                uid=self.settings.TARGET_USER,
+                fileids=[ref.fileid],
+                tagids=[tagid],
+                files=[ref],
+                raw=raw,
+            )
+            self.pipeline.process(event)
+        return count
+
+    def _sweep_immich(self, skip_tagids: set[int]) -> int:
+        """List system tags + sweep every immich / immich-<album> trigger tag."""
+        try:
+            tags = self.client.list_tags()
+        except NcApiError as exc:
+            log.warning("poll: could not list tags for immich", extra={"err": str(exc)})
+            return 0
+        count = 0
+        for tag in tags:
+            if tag.id is None or tag.id in skip_tagids:
+                continue
+            if not is_immich_tag(tag.name, self.settings.IMMICH_TAG):
+                continue
+            skip_tagids.add(tag.id)
+            album = immich_album_from_tag(tag.name, self.settings.IMMICH_TAG)
+            count += self._sweep_tag(tag.id, tag.name, album=album)
+        return count
 
     def run_forever(self) -> None:
         """Sweep every ``POLL_INTERVAL`` seconds until :meth:`stop` is called."""

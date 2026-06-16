@@ -31,6 +31,7 @@ trigger tag** to mark it done and make it re-runnable. Temp files are cleaned.
 | `render-png` | Render/convert → PNG, preserving transparency (PSD, camera RAW, TIFF, PDF/AI/EPS/PS, HEIC/AVIF/WEBP, JP2, SVG, BMP/GIF/ICO/TGA/DDS/XCF, Affinity preview) |
 | `render`     | Render/convert → JPG, flattened onto white (same source types as `render-png`) |
 | `shred` / `shred-confirm` | ⚠️ **DESTRUCTIVE, opt-in** (`ENABLE_SHRED`). Two-step permanent purge-from-Nextcloud, confined to `SHRED_DIR` — see [⚠️ Shred](#️-shred-destructive-opt-in) |
+| `immich` / `immich-<album>` | **Opt-in** (`ENABLE_IMMICH`). Upload a COPY of the photo/video (or every media file under a folder) to a separate **Immich** server; `immich-<album>` also adds it to album `<album>`. NC original kept — see [Immich integration](#immich-integration) |
 
 The map is configurable via `TAG_ACTIONS`. `render`/`render-png` use an
 extensible renderer registry — adding a source type is a few lines (see
@@ -210,6 +211,11 @@ All via environment (see `.env.example`). Mirrors `config.py`:
 | `SHRED_DIR` | `Shredder` | Folder shred is strictly confined to (within the account's namespace) |
 | `SHRED_TAG` | `shred` | Tag that stages a shred request |
 | `SHRED_CONFIRM_TAG` | `shred-confirm` | Tag (on the CONFIRM receipt) that performs the purge |
+| `ENABLE_IMMICH` | `false` | Enable the `immich` / `immich-<album>` actions (default OFF) |
+| `IMMICH_URL` | `""` | Immich base URL (no trailing `/api`) |
+| `IMMICH_API_KEY` | `""` | Per-user Immich API key (sent as `x-api-key`) |
+| `IMMICH_DEVICE_ID` | `nextcloud-powertools` | Device id reported on every upload |
+| `IMMICH_TAG` | `immich` | Base trigger tag (`immich`, `immich-<album>`) |
 | `POLL_INTERVAL` | `60` | Polling seconds; `0` ⇒ webhook-only |
 | `MAX_UNCOMPRESSED_SIZE` | `2147483648` | Zip-bomb guard (bytes) |
 | `MAX_FILES` | `10000` | Zip-bomb guard (member count) |
@@ -256,6 +262,66 @@ for **single files and tagged folders alike** (the directory walk renders any
 registered extension automatically). For a new delegate (e.g. HEIC), add the apt
 package (`libheif1`) in the `Dockerfile` runtime stage — most are already
 installed.
+
+## Immich integration
+
+Push your Nextcloud photos and videos into a separate [Immich](https://immich.app)
+server with a tag. It is **opt-in** (`ENABLE_IMMICH=false` by default) and
+**non-destructive** — it uploads a **copy**; the Nextcloud original is always
+kept, and only the trigger tag is removed once the upload succeeds.
+
+### The two tags
+
+| Tag | Effect |
+|-----|--------|
+| `immich` | Upload the file (or every media file under a tagged folder) to the Immich **main library** — no album. |
+| `immich-<album>` | Same, plus **find-or-create** the album `<album>` and add the uploaded asset(s) to it. The album name is everything after the first `-`, spaces preserved (`immich-Summer Trip` → album `"Summer Trip"`). An empty suffix (`immich-`) behaves like plain `immich`. |
+
+These are **parameterized/prefix trigger tags** — unlike every other tag they are
+*not* pre-registered. With `ENABLE_IMMICH=true` the worker treats `immich` and
+**any** `immich-…` system tag as a trigger, so you can invent
+`immich-anything` on the fly. (Internally the poller lists system tags each sweep
+and matches the prefix; the album is parsed from the suffix.)
+
+### Get an API key
+
+In Immich: **Account Settings → API Keys → New API Key**. It needs the
+`asset.upload` and album permissions (or simply `all`). Put it in `IMMICH_API_KEY`
+and set `IMMICH_URL` to your Immich base URL (e.g. `https://immich.example.com`,
+**no** trailing `/api`).
+
+```dotenv
+ENABLE_IMMICH=true
+IMMICH_URL=https://immich.example.com
+IMMICH_API_KEY=<your-api-key>
+# IMMICH_DEVICE_ID=nextcloud-powertools   # (defaults shown)
+# IMMICH_TAG=immich
+```
+
+Run `selftest` after configuring — it pings Immich, prints the server version,
+verifies the API key (lists albums), and reports how many media types Immich
+accepts. It is tolerant of Immich being unreachable (prints a `FAIL` line, no
+crash).
+
+### What it does
+
+- **Single file:** download the bytes, SHA-1 them, run Immich's
+  `bulk-upload-check` precheck, then `POST /api/assets` (multipart, with an
+  `x-immich-checksum` header and a stable `deviceAssetId = nc:<fileid>`). The
+  WebDAV modification time becomes `fileCreatedAt`/`fileModifiedAt`.
+- **Folder:** walk it, **filter to media types Immich accepts** (fetched live from
+  `/api/server/media-types`; non-media like `.txt` are skipped and logged),
+  upload each (respecting `MAX_FILES`), and add them all to the album if one was
+  given.
+- **Dedup / idempotency:** Immich dedupes by SHA-1 checksum. A file already in
+  Immich is **not** re-uploaded, but its existing asset id is still harvested so
+  it can be added to the requested album. Re-running a tag is always safe.
+- **Failure** (e.g. Immich down, a 500): the trigger tag is **kept** (so it
+  retries) and the optional `ERROR_TAG` is applied — the standard non-destructive
+  failure behavior. The Nextcloud original is never touched.
+
+> Album names are **not unique** in Immich. If several albums share the name, the
+> worker uses the **oldest** (by creation time) and logs the ambiguity.
 
 ## ⚠️ Shred (destructive, opt-in)
 

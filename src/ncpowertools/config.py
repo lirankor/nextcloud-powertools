@@ -64,6 +64,35 @@ def parse_tag_actions(value: object) -> dict[str, str]:
     return result
 
 
+def immich_album_from_tag(tag_name: str, immich_tag: str) -> str | None:
+    """Parse the Immich album from a trigger tag name (the prefix mechanism).
+
+    The exact tag ``<immich_tag>`` -> ``None`` (main library, no album). A tag
+    ``<immich_tag>-<album>`` -> ``<album>`` (everything after the FIRST ``-``,
+    spaces preserved). An empty suffix (``<immich_tag>-``) -> ``None``. Returns
+    the album string, or ``None`` when the tag selects no album. **The caller
+    must already have established (via** :func:`is_immich_tag` **) that the tag is
+    an immich-pattern tag** — this only parses the suffix.
+    """
+    if tag_name == immich_tag:
+        return None
+    prefix = immich_tag + "-"
+    if tag_name.startswith(prefix):
+        album = tag_name[len(prefix):]
+        return album or None
+    return None
+
+
+def is_immich_tag(tag_name: str, immich_tag: str) -> bool:
+    """Whether ``tag_name`` is an immich-pattern trigger tag.
+
+    True for the exact ``<immich_tag>`` and any ``<immich_tag>-<suffix>`` (the
+    parameterized/prefix trigger-tag mechanism, F6). ``<immich_tag>-`` (empty
+    suffix) still matches the action (just selects no album).
+    """
+    return tag_name == immich_tag or tag_name.startswith(immich_tag + "-")
+
+
 class Settings(BaseSettings):
     """Runtime configuration. Instantiate via :func:`load_settings`."""
 
@@ -102,6 +131,23 @@ class Settings(BaseSettings):
     # Trigger tags for the two-step handshake.
     SHRED_TAG: str = "shred"
     SHRED_CONFIRM_TAG: str = "shred-confirm"
+
+    # --- immich (opt-in; see README "Immich integration") ---
+    # When false (default) the immich action is NOT registered and any immich /
+    # immich-<album> tag is IGNORED. Turning this on enables uploading a COPY of
+    # tagged photos/videos to a separate Immich server (NC original is kept).
+    ENABLE_IMMICH: bool = False
+    # Base URL of the Immich server, e.g. https://immich.example.com (no trailing
+    # /api). The service talks to ``<IMMICH_URL>/api/...``.
+    IMMICH_URL: str = ""
+    # Per-user Immich API key (Account Settings -> API Keys). Sent as x-api-key.
+    IMMICH_API_KEY: str = ""
+    # Stable, constant device id reported on every upload (groups all uploads as
+    # one "device" in Immich).
+    IMMICH_DEVICE_ID: str = "nextcloud-powertools"
+    # Base trigger tag. ``<IMMICH_TAG>`` (exact) uploads to the main library; any
+    # ``<IMMICH_TAG>-<album>`` tag uploads + adds to album ``<album>``.
+    IMMICH_TAG: str = "immich"
 
     # --- safety limits ---
     MAX_UNCOMPRESSED_SIZE: int = 2147483648  # 2 GiB

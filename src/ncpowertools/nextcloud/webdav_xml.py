@@ -11,6 +11,8 @@ Three namespaces are in play everywhere (CONTEXT.md §2):
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from urllib.parse import unquote
 
 from lxml import etree
@@ -174,6 +176,14 @@ def build_count_propfind() -> bytes:
     prop = etree.SubElement(root, _qn("d", "prop"))
     etree.SubElement(prop, _qn("oc", "fileid"))
     etree.SubElement(prop, _qn("d", "resourcetype"))
+    return _serialize(root)
+
+
+def build_lastmodified_propfind() -> bytes:
+    """PROPFIND body requesting just ``d:getlastmodified`` (Immich mtime, F6)."""
+    root = etree.Element(_qn("d", "propfind"), nsmap=NSMAP)
+    prop = etree.SubElement(root, _qn("d", "prop"))
+    etree.SubElement(prop, _qn("d", "getlastmodified"))
     return _serialize(root)
 
 
@@ -353,6 +363,28 @@ def parse_trash_items(xml: bytes | str) -> list[dict[str, object]]:
             }
         )
     return items
+
+
+def parse_lastmodified(xml: bytes | str) -> datetime | None:
+    """Parse ``d:getlastmodified`` (RFC 1123) from a Depth-0 PROPFIND -> aware UTC.
+
+    Returns ``None`` if the prop is absent or unparseable (caller falls back to
+    ``now()``). The header date is GMT/UTC; we return a tz-aware UTC datetime.
+    """
+    root = _parse_multistatus(xml)
+    response = root.find(_qn("d", "response"))
+    if response is None:
+        return None
+    text = _text(response.find(f".//{_qn('d', 'getlastmodified')}"))
+    if not text:
+        return None
+    try:
+        dt = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def parse_content_location_id(content_location: str) -> int | None:

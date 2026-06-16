@@ -45,21 +45,37 @@ from __future__ import annotations
 import shutil
 import zipfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
+from .config import immich_album_from_tag, is_immich_tag
 from .errors import HandlerError
 from .handlers import resolve
 from .handlers.base import HandlerContext
+from .immich import sha1_of_file
 from .locking import file_lock
 from .logging import get_logger
 from .models import ActionResult, FileRef, TagEvent
 
 if TYPE_CHECKING:
     from .config import Settings
+    from .immich import ImmichService
     from .nextcloud import NextcloudClient
     from .shred import ShredService
 
 log = get_logger("pipeline")
+
+
+class ActionMatch(NamedTuple):
+    """A matched trigger tag: the action, its tag id, and an optional parameter.
+
+    ``param`` carries an action-specific parameter parsed from the trigger tag —
+    today only the Immich album name (from an ``immich-<album>`` tag); ``None``
+    for fixed-name tags and for the plain ``immich`` tag (main library).
+    """
+
+    action: str
+    tag_id: int
+    param: str | None = None
 
 # Render actions that, on a FOLDER source, walk the tree and render per file (F1)
 # — and whose outputs upload INTO the tagged dir (tree mirrored), not its parent.
@@ -68,6 +84,10 @@ _RENDER_ACTIONS = frozenset({"render", "render-png"})
 # Shred actions are SERVER-SIDE only (F5): they never download/upload content;
 # the pipeline routes them to ShredService instead of the handler flow.
 _SHRED_ACTIONS = frozenset({"shred", "shred-confirm"})
+
+# The immich action (F6) is server-side-ish like shred (routed to ImmichService),
+# but it DOES download the file bytes to re-upload them to the Immich server.
+_IMMICH_ACTION = "immich"
 
 
 class Pipeline:
@@ -83,6 +103,8 @@ class Pipeline:
         self._failed: dict[int, str] = {}
         # Lazily-built shred service (F5, opt-in). None until first needed.
         self._shred: ShredService | None = None
+        # Lazily-built immich service (F6, opt-in). None until first needed.
+        self._immich: ImmichService | None = None
 
     # ----------------------------------------------------------------- #
     # public entry point
@@ -129,14 +151,14 @@ class Pipeline:
                 log.info("skip: fileid not found", extra={"fileid": fileid})
                 return
 
-            match = self._match_action(fileid)
+            match = self._match_action(fileid, event)
             if match is None:
                 log.info(
                     "skip: no configured trigger tag on file",
                     extra={"fileid": fileid, "path": src.path},
                 )
                 return
-            action, trigger_tagid = match
+            action = match.action
 
             # Failure backoff: skip a file that failed last time and hasn't
             # changed since (avoids the poller hot-looping a broken file).
@@ -150,7 +172,7 @@ class Pipeline:
 
             work = self.work_root / str(fileid)
             try:
-                self._run(src, action, trigger_tagid, event, work)
+                self._run(src, match, event, work)
                 self._failed.pop(fileid, None)
             except HandlerError as exc:
                 self._on_failure(src, event, action, str(exc), mtime)
@@ -162,15 +184,21 @@ class Pipeline:
     def _run(
         self,
         src: FileRef,
-        action: str,
-        trigger_tagid: int,
+        match: ActionMatch,
         event: TagEvent,
         work: Path,
     ) -> None:
+        action, trigger_tagid = match.action, match.tag_id
         # F5: shred actions are server-side only — route to ShredService and
         # skip the entire download/handler/upload flow (no temp download).
         if action in _SHRED_ACTIONS:
             self._run_shred(src, action, trigger_tagid, event)
+            return
+
+        # F6: immich is routed to ImmichService — it downloads bytes (single
+        # file or a folder walk) and re-uploads them to the Immich server.
+        if action == _IMMICH_ACTION:
+            self._run_immich(src, match, event, work)
             return
 
         handler = resolve(action)
@@ -237,6 +265,171 @@ class Pipeline:
             self._shred.request(src, trigger_tagid, event.uid)
         else:  # "shred-confirm"
             self._shred.confirm(src, trigger_tagid, event.uid)
+
+    # ----------------------------------------------------------------- #
+    # immich (F6) — download bytes, upload a COPY to Immich, keep the original
+    # ----------------------------------------------------------------- #
+
+    def _run_immich(
+        self, src: FileRef, match: ActionMatch, event: TagEvent, work: Path
+    ) -> None:
+        """Upload the tagged file (or every media file under a tagged dir) to Immich.
+
+        Non-destructive: the NC original is never deleted; only the trigger tag
+        is removed on success. Dedup is via SHA-1 (bulk-upload-check +
+        ``x-immich-checksum``) so re-runs are safe. Failures propagate to the
+        standard non-destructive failure handler (trigger tag KEPT for retry).
+        """
+        if not self.settings.ENABLE_IMMICH:
+            log.info(
+                "skip: immich disabled (ENABLE_IMMICH=false)",
+                extra={"fileid": src.fileid},
+            )
+            return
+        if self._immich is None:
+            from .immich import ImmichService
+
+            self._immich = ImmichService(self.settings)
+        immich = self._immich
+        album = match.param
+
+        # Collect the local files to upload: a single file, or a folder walk
+        # filtered to Immich-accepted media types (respecting MAX_FILES).
+        if src.is_dir:
+            local_dir = self._download_folder(src, work)
+            files = self._immich_media_files(immich, local_dir, src)
+            if not files:
+                log.info("immich: no media files to upload", extra={"dir": src.path})
+                self.client.remove_tag(src.fileid, match.tag_id)
+                return
+        else:
+            dest = work / "src" / src.name
+            self.client.download_to(src.path, dest)
+            files = [(dest, src.path, src.fileid)]
+
+        asset_ids, created, dup, failed = self._immich_upload_batch(immich, src, files)
+
+        if failed and not asset_ids:
+            # Everything failed — surface as a failure (trigger tag kept, retriable).
+            raise HandlerError(f"immich: all {failed} upload(s) failed for {src.path}")
+
+        if album and asset_ids:
+            immich.find_or_create_album(album, asset_ids)
+
+        # Success: remove the trigger tag (non-destructive; re-runnable).
+        self.client.remove_tag(src.fileid, match.tag_id)
+        summary = (
+            f"uploaded {created}, duplicate {dup}, failed {failed}"
+            + (f", album '{album}'" if album else "")
+        )
+        log.info(
+            "immich processed",
+            extra={
+                "fileid": src.fileid,
+                "path": src.path,
+                "uploaded": created,
+                "duplicate": dup,
+                "failed": failed,
+                "album": album,
+                "assets": len(asset_ids),
+            },
+        )
+        if self.settings.NOTIFY:
+            self.client.notify(event.uid, "powertools: immich done", f"{src.name}: {summary}")
+
+    def _immich_media_files(
+        self, immich: ImmichService, local_dir: Path, src: FileRef
+    ) -> list[tuple[Path, str, int]]:
+        """Walk ``local_dir`` -> list of ``(local_path, remote_path, fileid)`` media.
+
+        Filters to files whose extension Immich accepts (image/video) using the
+        cached ``media_types`` allow-list; non-media are skipped (logged in the
+        summary). Enforces ``MAX_FILES`` as a hard cap. The ``remote_path`` is
+        the NC path (used only for the stable ``deviceAssetId``); the per-file
+        fileid is unknown for walked members so we synthesize a stable id from
+        the source dir fileid + relative path.
+        """
+        candidates = sorted(
+            p
+            for p in local_dir.rglob("*")
+            if p.is_file() and immich.is_accepted_media(p.name)
+        )
+        skipped = sum(
+            1 for p in local_dir.rglob("*") if p.is_file() and not immich.is_accepted_media(p.name)
+        )
+        if len(candidates) > self.settings.MAX_FILES:
+            raise HandlerError(
+                f"{len(candidates)} media files exceed MAX_FILES cap "
+                f"({self.settings.MAX_FILES}); aborting (raise MAX_FILES to allow)"
+            )
+        log.info(
+            "immich: scanned directory",
+            extra={"dir": src.path, "media": len(candidates), "skipped_non_media": skipped},
+        )
+        out: list[tuple[Path, str, int]] = []
+        for p in candidates:
+            rel = p.relative_to(local_dir).as_posix()
+            out.append((p, f"{src.path.strip('/')}/{rel}", src.fileid))
+        return out
+
+    def _immich_upload_batch(
+        self,
+        immich: ImmichService,
+        src: FileRef,
+        files: list[tuple[Path, str, int]],
+    ) -> tuple[list[str], int, int, int]:
+        """SHA-1 + bulk-check + upload each file. Returns (asset_ids, created, dup, failed).
+
+        For a directory walk the per-file ``deviceAssetId`` uses the dir fileid +
+        the file's remote path so it's stable per source file; for a single file
+        it is ``nc:<fileid>``. Duplicates (from the precheck OR a 200 upload)
+        still contribute their existing asset id so they can be added to an album.
+        """
+        # SHA-1 every file and run one bulk-check to learn which are duplicates.
+        checks: list[tuple[str, str]] = []
+        meta: dict[str, tuple[Path, str, str]] = {}  # corr_id -> (path, remote, sha1)
+        for i, (path, remote, _fid) in enumerate(files):
+            digest = sha1_of_file(path)
+            corr = str(i)
+            checks.append((corr, digest))
+            meta[corr] = (path, remote, digest)
+        try:
+            results = immich.bulk_check(checks)
+        except Exception as exc:  # noqa: BLE001 - precheck is best-effort
+            log.warning("immich: bulk-check failed; uploading all", extra={"error": str(exc)})
+            results = {}
+
+        asset_ids: list[str] = []
+        created = dup = failed = 0
+        for corr, (path, remote, digest) in meta.items():
+            action, existing = results.get(corr, ("accept", None))
+            if action == "reject" and existing:
+                # Already in Immich — harvest the id, skip the upload.
+                asset_ids.append(existing)
+                dup += 1
+                continue
+            device_asset_id = (
+                f"nc:{src.fileid}" if not src.is_dir else f"nc:{src.fileid}:{remote}"
+            )
+            mtime = self.client.last_modified(remote, user=self.settings.TARGET_USER)
+            try:
+                asset_id, status = immich.upload(
+                    path,
+                    device_asset_id=device_asset_id,
+                    file_created_at=mtime,
+                    file_modified_at=mtime,
+                    checksum=digest,
+                )
+            except Exception as exc:  # noqa: BLE001 - per-file isolation in a batch
+                failed += 1
+                log.warning("immich: upload failed", extra={"file": remote, "error": str(exc)})
+                continue
+            asset_ids.append(asset_id)
+            if status == "duplicate":
+                dup += 1
+            else:
+                created += 1
+        return asset_ids, created, dup, failed
 
     # ----------------------------------------------------------------- #
     # download
@@ -310,22 +503,42 @@ class Pipeline:
     # tag/action resolution
     # ----------------------------------------------------------------- #
 
-    def _match_action(self, fileid: int) -> tuple[str, int] | None:
-        """Return ``(action, trigger_tagid)`` for the first of the file's tags
-        that maps to a configured action, or ``None`` if none do.
+    def _match_action(self, fileid: int, event: TagEvent) -> ActionMatch | None:
+        """Return an :class:`ActionMatch` for the first of the file's tags that
+        maps to a configured action, or ``None`` if none do.
 
         We read the tags actually on the file (``tags_on_file``) so this works
         identically whether triggered by a webhook (which carries tagids we
         could trust) or the poller (which already searched by one tag). Going to
         the source of truth also means we never act on a tag that was removed
         between the trigger and processing.
+
+        Two matching mechanisms:
+
+        * **Fixed tags** — looked up in the static ``TAG_ACTIONS`` map.
+        * **Immich prefix tags (F6)** — when ``ENABLE_IMMICH``, a tag named
+          ``<IMMICH_TAG>`` (exact) or ``<IMMICH_TAG>-<album>`` (prefix) matches
+          the ``immich`` action; the album is parsed from the suffix (preferring
+          a poller-supplied ``event.raw["immich_album"]`` so spaces survive the
+          round-trip exactly, falling back to parsing the tag name). These are
+          deliberately NOT in ``TAG_ACTIONS`` so ``immich-anything`` works
+          without pre-registration.
         """
+        raw_album = event.raw.get("immich_album")
+        poller_album = raw_album if isinstance(raw_album, str) else None
         for tag in self.client.tags_on_file(fileid):
             if tag.id is None:
                 continue
             action = self.settings.TAG_ACTIONS.get(tag.name)
             if action:
-                return action, tag.id
+                return ActionMatch(action, tag.id, None)
+            if self.settings.ENABLE_IMMICH and is_immich_tag(
+                tag.name, self.settings.IMMICH_TAG
+            ):
+                album = poller_album or immich_album_from_tag(
+                    tag.name, self.settings.IMMICH_TAG
+                )
+                return ActionMatch(_IMMICH_ACTION, tag.id, album)
         return None
 
     # ----------------------------------------------------------------- #

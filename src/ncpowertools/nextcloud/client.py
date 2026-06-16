@@ -11,6 +11,7 @@ the separator (CONTEXT.md §2).
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING
 from urllib.parse import quote
@@ -204,6 +205,26 @@ class NextcloudClient:
                 for chunk in resp.iter_bytes():
                     fh.write(chunk)
         return dest
+
+    def last_modified(self, path: str, user: str | None = None) -> datetime | None:
+        """Return a file's modification time (PROPFIND ``getlastmodified``) or None.
+
+        Used by the Immich integration (F6) to set ``fileCreatedAt`` /
+        ``fileModifiedAt`` from the WebDAV mtime. Best-effort: an unparseable or
+        missing date returns ``None`` (the caller falls back to ``now()``).
+        """
+        body = xml.build_lastmodified_propfind()
+        try:
+            resp = self._request(
+                "PROPFIND",
+                self._files_url(path, user=user),
+                content=body,
+                headers={"Content-Type": "application/xml", "Depth": "0"},
+                ok=(207,),
+            )
+        except NcApiError:
+            return None
+        return xml.parse_lastmodified(resp.content)
 
     def upload(self, path: str, data: bytes | IO[bytes]) -> None:
         """PUT raw bytes (or a file object) to ``path`` (overwrites if present)."""

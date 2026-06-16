@@ -158,7 +158,22 @@ Owner must live-validate (destructive — agents can't).
 - Each feature, when built, follows the same dark-factory rhythm: spec → dev agent → verify
   (incl. real dockerized smoke for binary-backed tools) → CI green → mark ✅ here + in PLAN.md.
 
-## F6 — `immich` / `immich-<album>`: push photos to Immich  🟡 researching (parameterized tag)
+## F6 — `immich` / `immich-<album>`: push photos to Immich  ✅ done (parameterized tag, opt-in)
+**Requested:** 2026-06-16. **Shipped:** 2026-06-16 (M10). Mock-verified; owner MUST live-validate
+against the real Immich. New `src/ncpowertools/immich.py` (`ImmichService`: ping/version/media-types
+(cached)/bulk_check/upload/list_albums/find_or_create_album/add_to_album + `sha1_of_file`/`iso_utc`).
+**Parameterized/prefix trigger tags** (`is_immich_tag`/`immich_album_from_tag` in config): the poller
+`list_tags()` + prefix-matches `immich`/`immich-*` and the pipeline `_match_action` returns an
+`ActionMatch(action, tag_id, param=album)`; the album is everything after the first `-` (poller
+carries it on `event.raw["immich_album"]`, else parsed from the tag name). `_run_immich` downloads
+bytes (single file or folder walk filtered by Immich media-types, MAX_FILES cap), SHA-1 + bulk-check
+dedup, `POST /api/assets` (multipart, `deviceAssetId=nc:<fileid>`, `x-immich-checksum`, mtime from a
+new `client.last_modified` PROPFIND), find-or-create album, removes the trigger tag; NC original kept.
+Opt-in `ENABLE_IMMICH=false`; failure keeps the tag + ERROR_TAG (non-destructive). selftest phase 3
+pings Immich when enabled. README "Immich integration" section. 178 pass + 5 skip, ruff+mypy clean,
+docker build+selftest smoke OK.
+
+### Original notes
 **Requested:** 2026-06-16.
 New integration power tool — upload Nextcloud photos (file OR tagged directory) into a separate
 **Immich** server via its REST API. Non-destructive (NC original kept; trigger tag removed).
