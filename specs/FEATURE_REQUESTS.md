@@ -157,3 +157,26 @@ Owner must live-validate (destructive — agents can't).
   the owner's disk-check (stub vs real file).
 - Each feature, when built, follows the same dark-factory rhythm: spec → dev agent → verify
   (incl. real dockerized smoke for binary-backed tools) → CI green → mark ✅ here + in PLAN.md.
+
+## F6 — `immich` / `immich-<album>`: push photos to Immich  🟡 researching (parameterized tag)
+**Requested:** 2026-06-16.
+New integration power tool — upload Nextcloud photos (file OR tagged directory) into a separate
+**Immich** server via its REST API. Non-destructive (NC original kept; trigger tag removed).
+- **`immich`** → upload to Immich main timeline/library, NO album.
+- **`immich-<album-name>`** → find-or-create album `<album-name>`, upload + add asset(s). Album name
+  = everything after the first `-` (spaces allowed).
+- **Directory** → walk, upload all media files (respect MAX_FILES); for `immich-<album>` all go in
+  the album.
+
+NEW MECHANISM — **parameterized/prefix trigger tags.** Unlike all prior fixed-name tags, the album
+variant embeds a parameter. Extend trigger-matching: list system tags, match `immich` exactly +
+`immich-*` by prefix, parse the album from the suffix. Reusable for future parameterized tools.
+
+Flow: WebDAV download → Immich API upload (checksum dedup = idempotent) → create/add album →
+remove trigger tag. Opt-in `ENABLE_IMMICH=false`; config `IMMICH_URL`, `IMMICH_API_KEY` (per-user
+API key, `x-api-key`). New handler/service family (not the render registry).
+
+NEEDS (research agent, in progress): exact current Immich API — asset upload endpoint + required
+multipart fields (deviceAssetId/deviceId/fileCreatedAt/fileModifiedAt), checksum/dedup response,
+album list/create/add-assets endpoints, API-key auth, server-version/ping probe. Then spec → dev
+agent → mock + docker smoke → CI. Owner live-validates against the real Immich.
