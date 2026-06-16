@@ -126,8 +126,34 @@ implement embedded-preview extraction if a reliable method exists, or document u
 
 ---
 
+## F5 — `shred`: guarded permanent delete (file + dir)  🟡 researching (DESTRUCTIVE)
+**Requested:** 2026-06-16.
+A deliberately destructive action — the ONE feature that breaks the tool's "never delete user
+content" invariant, so it is the most heavily guarded. Owner's locked decisions:
+- **Behavior:** **permanent purge** — best-effort overwrite → WebDAV `DELETE` → empty from NC
+  **trash** → purge **file versions**. (NOT forensically secure: storage layer + **Kopia/hetzbox
+  backups** still retain the data — document loudly.)
+- **Anti-accident = generated-artifact handshake + second tag (owner's idea):**
+  1. Tag target with **`shred`** → worker writes a `CONFIRM-SHRED-<…>.md` receipt beside it (path,
+     size, file count, warning, machine-readable target ref in front-matter) and **removes the
+     `shred` tag**. No deletion yet.
+  2. Owner adds **`shred-confirm`** to that confirmation file → worker reads the target ref,
+     re-validates scope, performs the permanent purge, writes a receipt, notifies, audit-logs.
+  3. Removing the tag / deleting the confirmation file cancels. (Stale unconfirmed requests just
+     sit; optional TTL.)
+- **Guardrails:** opt-in `ENABLE_SHRED=false` (default OFF); only operates **inside a designated
+  `SHRED_DIR`** AND **within the service account's own namespace** (refuse SHRED_DIR root, account
+  root, anything outside, shared mounts); always OCS-notify + structured audit log every step.
+- **Tags configurable** (`shred` / `shred-confirm`). New handler family (not the render registry).
+
+NEEDS (research agent, in progress): exact NC 33 WebDAV endpoints for (a) DELETE→trash vs the
+trashbin app (`/remote.php/dav/trashbin/{user}/trash`: PROPFIND list + DELETE item + empty-all),
+(b) file-versions purge (`/remote.php/dav/versions/{user}/versions/{fileid}`), (c) whether a plain
+files DELETE goes to trash by default. Then: spec → dev agent → mock + dockerized smoke → CI.
+Owner must live-validate (destructive — agents can't).
+
 ## Process
-- New requests get appended here with date + status. Build order is F1 → F2 → F4 (render exts) →
-  F3 (F1 unblocks the directory infra; F3 is gated on the clarification above).
+- New requests get appended here with date + status. Build order is F1 → F2 → F4 → F5; F3 gated on
+  the owner's disk-check (stub vs real file).
 - Each feature, when built, follows the same dark-factory rhythm: spec → dev agent → verify
   (incl. real dockerized smoke for binary-backed tools) → CI green → mark ✅ here + in PLAN.md.
