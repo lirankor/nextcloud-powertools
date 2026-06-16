@@ -92,6 +92,17 @@ class Settings(BaseSettings):
     ENABLE_RAR: bool = False
     POLL_INTERVAL: int = 60
 
+    # --- shred (DESTRUCTIVE, opt-in; see README "⚠️ Shred") ---
+    # When false (default) the shred actions are NOT registered and any shred
+    # tag is ignored. Turning this on enables a permanent purge-from-Nextcloud.
+    ENABLE_SHRED: bool = False
+    # Path (relative to the user namespace root) shred is strictly confined to.
+    # Shred refuses anything that is not strictly INSIDE this folder.
+    SHRED_DIR: str = "Shredder"
+    # Trigger tags for the two-step handshake.
+    SHRED_TAG: str = "shred"
+    SHRED_CONFIRM_TAG: str = "shred-confirm"
+
     # --- safety limits ---
     MAX_UNCOMPRESSED_SIZE: int = 2147483648  # 2 GiB
     MAX_FILES: int = 10000
@@ -124,6 +135,12 @@ class Settings(BaseSettings):
             self.NC_ADMIN_PASSWORD = self.NC_APP_PASSWORD
         if not self.TARGET_USER:
             self.TARGET_USER = self.NC_USER
+        # When shred is enabled, its two tags become active trigger tags so the
+        # poller searches them and the pipeline routes them. When disabled they
+        # are deliberately absent — a shred tag is then never even searched for.
+        if self.ENABLE_SHRED:
+            self.TAG_ACTIONS.setdefault(self.SHRED_TAG, "shred")
+            self.TAG_ACTIONS.setdefault(self.SHRED_CONFIRM_TAG, "shred-confirm")
         return self
 
 

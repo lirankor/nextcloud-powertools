@@ -57,12 +57,17 @@ from .models import ActionResult, FileRef, TagEvent
 if TYPE_CHECKING:
     from .config import Settings
     from .nextcloud import NextcloudClient
+    from .shred import ShredService
 
 log = get_logger("pipeline")
 
 # Render actions that, on a FOLDER source, walk the tree and render per file (F1)
 # — and whose outputs upload INTO the tagged dir (tree mirrored), not its parent.
 _RENDER_ACTIONS = frozenset({"render", "render-png"})
+
+# Shred actions are SERVER-SIDE only (F5): they never download/upload content;
+# the pipeline routes them to ShredService instead of the handler flow.
+_SHRED_ACTIONS = frozenset({"shred", "shred-confirm"})
 
 
 class Pipeline:
@@ -76,6 +81,8 @@ class Pipeline:
         self._tagid_by_name: dict[str, int] | None = None
         # fileid -> mtime string that failed last run (skip until it changes).
         self._failed: dict[int, str] = {}
+        # Lazily-built shred service (F5, opt-in). None until first needed.
+        self._shred: ShredService | None = None
 
     # ----------------------------------------------------------------- #
     # public entry point
@@ -160,6 +167,12 @@ class Pipeline:
         event: TagEvent,
         work: Path,
     ) -> None:
+        # F5: shred actions are server-side only — route to ShredService and
+        # skip the entire download/handler/upload flow (no temp download).
+        if action in _SHRED_ACTIONS:
+            self._run_shred(src, action, trigger_tagid, event)
+            return
+
         handler = resolve(action)
         if not handler.can_handle(src):
             # e.g. extract/render on a folder, or extract on a non-archive.
@@ -200,6 +213,30 @@ class Pipeline:
                 f"powertools: {action} done",
                 result.message or f"{action} completed for {src.name}",
             )
+
+    def _run_shred(
+        self, src: FileRef, action: str, trigger_tagid: int, event: TagEvent
+    ) -> None:
+        """Route a shred / shred-confirm action to the ShredService (F5).
+
+        If ENABLE_SHRED is off, the actions are never registered as triggers, so
+        this is normally unreachable — but we still guard (log once) so a stale
+        shred tag from a previous enabled run is ignored, not acted on.
+        """
+        if not self.settings.ENABLE_SHRED:
+            log.info(
+                "skip: shred disabled (ENABLE_SHRED=false)",
+                extra={"fileid": src.fileid, "action": action},
+            )
+            return
+        if self._shred is None:
+            from .shred import ShredService
+
+            self._shred = ShredService(self.client, self.settings)
+        if action == "shred":
+            self._shred.request(src, trigger_tagid, event.uid)
+        else:  # "shred-confirm"
+            self._shred.confirm(src, trigger_tagid, event.uid)
 
     # ----------------------------------------------------------------- #
     # download

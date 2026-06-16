@@ -95,6 +95,34 @@ def cmd_selftest(settings: Settings) -> int:
             else:
                 spec = client.ensure_tag(tag)
                 report.append(f"  [ok] trigger tag '{tag}' created (id={spec.id})")
+
+        # Shred config + trash/version capability report (F5). When enabled, the
+        # operator needs to see whether a permanent purge is actually possible.
+        if settings.ENABLE_SHRED:
+            report.append("Shred (DESTRUCTIVE, opt-in) — ENABLED:")
+            report.append(f"  [!!] SHRED_DIR='{settings.SHRED_DIR}' (confined to this folder)")
+            report.append(
+                f"  [!!] tags: request='{settings.SHRED_TAG}', "
+                f"confirm='{settings.SHRED_CONFIRM_TAG}'"
+            )
+            caps = client.files_capabilities()
+            trash = "enabled" if caps["undelete"] else "DISABLED (DELETE is immediately permanent)"
+            report.append(f"  [..] trash (undelete): {trash}")
+            if caps["undelete"]:
+                if caps["delete_from_trash"]:
+                    report.append("  [ok] delete_from_trash: allowed -> permanent purge possible")
+                else:
+                    report.append(
+                        "  [!!] delete_from_trash: DISABLED -> permanent purge NOT possible "
+                        "(confirm will FAIL with a clear note)"
+                    )
+            report.append(
+                f"  [..] versioning={caps['versioning']}, "
+                f"version_deletion={caps['version_deletion']} "
+                "(versions auto-purged with the trash delete)"
+            )
+        else:
+            report.append("Shred: disabled (ENABLE_SHRED=false) — shred tags ignored")
     except (NcApiError, httpx.HTTPError, OSError) as exc:
         # httpx transport errors (ConnectError/TimeoutException/…) are HTTPError
         # subclasses, NOT OSError — catch them so an unreachable NC produces the

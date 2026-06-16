@@ -455,3 +455,93 @@ def test_non_2xx_raises_ncapierror_with_status_and_url() -> None:
         c.download("missing.txt")
     assert exc.value.status == 404
     assert exc.value.url is not None and "missing.txt" in exc.value.url
+
+
+# --------------------------------------------------------------------------- #
+# shred / trash XML parsers + capability flags (F5)
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_shred_props_local_file() -> None:
+    body = (
+        '<?xml version="1.0"?>'
+        '<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" '
+        'xmlns:nc="http://nextcloud.org/ns">'
+        f"<d:response><d:href>/remote.php/dav/files/{USER}/Shredder/a</d:href>"
+        "<d:propstat><d:prop><oc:fileid>55</oc:fileid><oc:size>4096</oc:size>"
+        "<oc:share-types/><nc:mount-type/><d:resourcetype/></d:prop>"
+        "<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+        "</d:multistatus>"
+    )
+    props = xml.parse_shred_props(body)
+    assert props["fileid"] == 55
+    assert props["size"] == 4096
+    assert props["share_types"] == []
+    assert props["mount_type"] is None
+    assert props["is_dir"] is False
+
+
+def test_parse_shred_props_detects_share_and_mount() -> None:
+    body = (
+        '<?xml version="1.0"?>'
+        '<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" '
+        'xmlns:nc="http://nextcloud.org/ns">'
+        f"<d:response><d:href>/remote.php/dav/files/{USER}/Shredder/b</d:href>"
+        "<d:propstat><d:prop><oc:fileid>56</oc:fileid>"
+        "<oc:share-types><oc:share-type>0</oc:share-type></oc:share-types>"
+        "<nc:mount-type>shared</nc:mount-type>"
+        "<d:resourcetype><d:collection/></d:resourcetype></d:prop>"
+        "<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+        "</d:multistatus>"
+    )
+    props = xml.parse_shred_props(body)
+    assert props["share_types"] == [0]
+    assert props["mount_type"] == "shared"
+    assert props["is_dir"] is True
+
+
+def test_parse_trash_items_takes_node_from_href() -> None:
+    body = (
+        '<?xml version="1.0"?>'
+        '<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" '
+        'xmlns:nc="http://nextcloud.org/ns">'
+        f"<d:response><d:href>/remote.php/dav/trashbin/{USER}/trash/</d:href>"
+        "<d:propstat><d:prop/><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+        f"<d:response><d:href>/remote.php/dav/trashbin/{USER}/trash/doomed.d999</d:href>"
+        "<d:propstat><d:prop><oc:fileid>91</oc:fileid>"
+        "<nc:trashbin-original-location>Shredder/doomed</nc:trashbin-original-location>"
+        "<nc:trashbin-deletion-time>999</nc:trashbin-deletion-time></d:prop>"
+        "<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+        "</d:multistatus>"
+    )
+    items = xml.parse_trash_items(body)
+    # the collection root response is skipped; one real item remains
+    assert len(items) == 1
+    assert items[0]["node_name"] == "doomed.d999"
+    assert items[0]["fileid"] == 91
+    assert items[0]["original_location"] == "Shredder/doomed"
+    assert items[0]["deletion_time"] == 999
+
+
+@respx.mock
+def test_files_capabilities_defaults_missing_to_true() -> None:
+    respx.get(f"{BASE}/ocs/v2.php/cloud/capabilities").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "ocs": {
+                    "data": {
+                        "version": {"major": 33, "minor": 0, "micro": 0},
+                        "capabilities": {"files": {"undelete": True, "delete_from_trash": False}},
+                    }
+                }
+            },
+        )
+    )
+    with NextcloudClient(_settings()) as c:
+        caps = c.files_capabilities()
+    assert caps["undelete"] is True
+    assert caps["delete_from_trash"] is False
+    # missing keys default to True (older-server tolerant)
+    assert caps["versioning"] is True
+    assert caps["version_deletion"] is True

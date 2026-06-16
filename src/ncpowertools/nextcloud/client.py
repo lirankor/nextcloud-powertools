@@ -132,6 +132,41 @@ class NextcloudClient:
     def major(self) -> int:
         return self.capabilities()[0]
 
+    def files_capabilities(self) -> dict[str, bool]:
+        """Return the ``files`` capability flags relevant to shred (F5).
+
+        Reads ``ocs.data.capabilities.files`` and returns the trash/version
+        flags: ``undelete`` (trash enabled), ``delete_from_trash`` (permanent
+        purge from trash allowed), ``versioning``, ``version_deletion``.
+        **Missing keys default to True** ("allowed/default on older servers")
+        per the verified NC facts — except when the whole ``files`` block is
+        absent, in which case we still default each to True so an older server
+        isn't wrongly treated as trash-disabled.
+        """
+        resp = self._request(
+            "GET",
+            "/ocs/v2.php/cloud/capabilities?format=json",
+            headers=_OCS_HEADERS,
+            ok=(200,),
+        )
+        try:
+            files = resp.json()["ocs"]["data"]["capabilities"].get("files", {})
+        except (KeyError, TypeError, ValueError):
+            files = {}
+        if not isinstance(files, dict):
+            files = {}
+
+        def flag(key: str) -> bool:
+            val = files.get(key, True)  # missing => allowed/default True
+            return bool(val)
+
+        return {
+            "undelete": flag("undelete"),
+            "delete_from_trash": flag("delete_from_trash"),
+            "versioning": flag("versioning"),
+            "version_deletion": flag("version_deletion"),
+        }
+
     # ----------------------------------------------------------------- #
     # download / upload
     # ----------------------------------------------------------------- #
@@ -196,6 +231,90 @@ class NextcloudClient:
         for i in range(1, len(parts) + 1):
             sub = "/".join(parts[:i])
             self._request("MKCOL", self._files_url(sub), ok=(201, 405))
+
+    # ----------------------------------------------------------------- #
+    # shred support (DESTRUCTIVE — used only by ShredService, F5)
+    # ----------------------------------------------------------------- #
+
+    def propfind_props(self, path: str, user: str | None = None) -> dict[str, object]:
+        """PROPFIND (Depth 0) a shred target for its scope-guard props.
+
+        Returns the dict from :func:`webdav_xml.parse_shred_props`:
+        ``fileid``, ``size``, ``share_types``, ``mount_type``, ``is_dir``.
+        Used to verify identity + refuse received shares / external mounts
+        before a destructive DELETE.
+        """
+        body = xml.build_shred_propfind()
+        resp = self._request(
+            "PROPFIND",
+            self._files_url(path, user=user),
+            content=body,
+            headers={"Content-Type": "application/xml", "Depth": "0"},
+            ok=(207,),
+        )
+        return xml.parse_shred_props(resp.content)
+
+    def count_files(self, path: str, user: str | None = None) -> int:
+        """Count non-collection members under a folder (Depth infinity).
+
+        Best-effort for the receipt's "file count". Returns the number of
+        responses that are NOT collections (the folder itself is excluded).
+        """
+        body = xml.build_count_propfind()
+        resp = self._request(
+            "PROPFIND",
+            self._files_url(path, user=user),
+            content=body,
+            headers={"Content-Type": "application/xml", "Depth": "infinity"},
+            ok=(207,),
+        )
+        # Reuse the file-report parser shape: count refs that are not dirs.
+        refs = xml.parse_file_report(resp.content, user=user or self.user)
+        return sum(1 for r in refs if not r.is_dir)
+
+    def delete_file(self, path: str, user: str | None = None) -> None:
+        """DELETE a file/folder in the user's files namespace -> trash (204).
+
+        Plain WebDAV DELETE moves the target to the trashbin when trash is
+        enabled (recoverable); recursive for folders. **Destructive** — only
+        called by :class:`~ncpowertools.shred.ShredService` after every guard
+        has passed.
+        """
+        self._request("DELETE", self._files_url(path, user=user), ok=(204,))
+
+    def list_trash(self, user: str | None = None) -> list[dict[str, object]]:
+        """PROPFIND the user's trashbin -> list of trash-item dicts.
+
+        Each item carries ``node_name`` (taken from the href tail, NEVER
+        constructed), ``fileid`` (stable, matches the live file's id),
+        ``original_location`` and ``deletion_time``.
+        """
+        user = user or self.user
+        body = xml.build_trash_propfind()
+        resp = self._request(
+            "PROPFIND",
+            f"/remote.php/dav/trashbin/{user}/trash",
+            content=body,
+            headers={"Content-Type": "application/xml", "Depth": "1"},
+            ok=(207,),
+        )
+        return xml.parse_trash_items(resp.content)
+
+    def delete_trash_item(self, node_name: str, user: str | None = None) -> None:
+        """Permanently purge one trash item (204). Also purges its versions.
+
+        ``node_name`` MUST come from a :meth:`list_trash` item's ``node_name``
+        (the href tail), never constructed. A ``403`` means
+        ``delete_from_trash`` is admin-disabled and surfaces as an
+        :class:`NcApiError`.
+        """
+        user = user or self.user
+        encoded = quote(node_name, safe="")
+        self._request(
+            "DELETE",
+            f"/remote.php/dav/trashbin/{user}/trash/{encoded}",
+            ok=(204,),
+        )
 
     # ----------------------------------------------------------------- #
     # fileid resolution

@@ -30,6 +30,7 @@ trigger tag** to mark it done and make it re-runnable. Temp files are cleaned.
 | `rar`        | Compress → `.rar` (opt-in build; default OFF — use `zip`/`7z` instead)  |
 | `render-png` | Render/convert → PNG, preserving transparency (PSD, camera RAW, TIFF, PDF/AI/EPS/PS, HEIC/AVIF/WEBP, JP2, SVG, BMP/GIF/ICO/TGA/DDS/XCF, Affinity preview) |
 | `render`     | Render/convert → JPG, flattened onto white (same source types as `render-png`) |
+| `shred` / `shred-confirm` | ⚠️ **DESTRUCTIVE, opt-in** (`ENABLE_SHRED`). Two-step permanent purge-from-Nextcloud, confined to `SHRED_DIR` — see [⚠️ Shred](#️-shred-destructive-opt-in) |
 
 The map is configurable via `TAG_ACTIONS`. `render`/`render-png` use an
 extensible renderer registry — adding a source type is a few lines (see
@@ -205,6 +206,10 @@ All via environment (see `.env.example`). Mirrors `config.py`:
 | `TAG_ACTIONS` | see below | JSON map override (env form must be **JSON**) |
 | `ERROR_TAG` | `powertools-error` | Tag assigned on failure (empty ⇒ disabled) |
 | `ENABLE_RAR` | `false` | Enable the `rar` action (also a build arg for the binary) |
+| `ENABLE_SHRED` | `false` | ⚠️ **DESTRUCTIVE.** Enable the `shred`/`shred-confirm` actions (default OFF) |
+| `SHRED_DIR` | `Shredder` | Folder shred is strictly confined to (within the account's namespace) |
+| `SHRED_TAG` | `shred` | Tag that stages a shred request |
+| `SHRED_CONFIRM_TAG` | `shred-confirm` | Tag (on the CONFIRM receipt) that performs the purge |
 | `POLL_INTERVAL` | `60` | Polling seconds; `0` ⇒ webhook-only |
 | `MAX_UNCOMPRESSED_SIZE` | `2147483648` | Zip-bomb guard (bytes) |
 | `MAX_FILES` | `10000` | Zip-bomb guard (member count) |
@@ -251,6 +256,85 @@ for **single files and tagged folders alike** (the directory walk renders any
 registered extension automatically). For a new delegate (e.g. HEIC), add the apt
 package (`libheif1`) in the `Dockerfile` runtime stage — most are already
 installed.
+
+## ⚠️ Shred (destructive, opt-in)
+
+> **This is the one feature that deletes your data.** It deliberately breaks the
+> tool's "never delete user content" invariant, so it is **OFF by default**
+> (`ENABLE_SHRED=false`) and heavily gated. Read this whole section before
+> enabling it.
+
+### What it actually does — and does NOT do
+
+`shred` performs a **permanent purge from Nextcloud**: it issues a WebDAV
+`DELETE` (which moves the target to the trash), then **permanently empties that
+item from the trash** — which also auto-purges the file's **versions**. After a
+successful shred the file is gone from the Nextcloud UI, the trash, and version
+history.
+
+**It is NOT secure/forensic erasure.** It does **not** overwrite the bytes
+(overwriting before delete on Nextcloud only creates version bloat with zero
+security benefit). The data may still persist in:
+
+- your **backups** (e.g. **Kopia / hetzbox** snapshots) until they age out;
+- the **storage layer** (copy-on-write filesystems, object stores, SSD wear
+  levelling, RAID, snapshots).
+
+So the honest framing is **"purge from Nextcloud,"** not "make the data
+unrecoverable." Every receipt and notification says so.
+
+### How to enable
+
+```env
+ENABLE_SHRED=true
+SHRED_DIR=Shredder          # the ONLY folder shred will touch
+# SHRED_TAG=shred           # (defaults shown)
+# SHRED_CONFIRM_TAG=shred-confirm
+```
+
+Create the two tags (selftest does this for you when `ENABLE_SHRED=true`) and a
+`Shredder` folder in the service account. When enabled, `selftest` also reports
+whether a permanent purge is actually possible on your server (the trash /
+`delete_from_trash` capability flags).
+
+### The two-step handshake (anti-accident)
+
+1. **Stage** — add the **`shred`** tag to a file or folder **inside `SHRED_DIR`**.
+   The worker validates the scope guards, then writes a
+   `CONFIRM-SHRED-<fileid>-<name>.md` **receipt** into `SHRED_DIR` (with the
+   target path, fileid, size, file count, a loud warning, and machine-readable
+   front-matter) and **removes the `shred` tag** from the target. *Nothing is
+   deleted yet.* State now lives entirely in the receipt.
+2. **Confirm** — add the **`shred-confirm`** tag to **that receipt file**. The
+   worker re-reads the receipt, **re-resolves the target by path, re-validates
+   every guard, and confirms the fileid still matches** (if the file changed, it
+   aborts). Only then does it perform the purge, replace the receipt with a
+   `SHREDDED-<name>-<ts>.md` record, and remove the confirm tag.
+3. **Cancel** — remove the `shred` tag, or delete the confirmation file. Stale
+   unconfirmed requests just sit there harmlessly.
+
+### The guards (every one refuses → logs + notifies, never deletes)
+
+- **Opt-in:** with `ENABLE_SHRED=false` the actions aren't even registered; a
+  shred tag is ignored (logged once).
+- **Confined to `SHRED_DIR`:** the target must be **strictly inside** `SHRED_DIR`
+  — never `SHRED_DIR` itself, never the account root, never `/`. Paths containing
+  `..` are refused.
+- **Own namespace only:** the app-password account can only address its own
+  `/files/<user>/`, `/trashbin/<user>/`, `/versions/<user>/` — it cannot reach
+  other users' data.
+- **Shares & mounts:** before acting, the worker PROPFINDs the target for
+  `oc:share-types` and `nc:mount-type`. If it's a **received share** or an
+  **external/group-folder mount**, a `DELETE` would only *unshare/unmount* it
+  (the owner keeps the data) **but return success** — so the worker **refuses**
+  and reports it, rather than falsely claiming a shred.
+- **Capability check:** if the server has `delete_from_trash` disabled, the
+  permanent purge isn't possible — the worker writes a **FAILED** note and does
+  **not** leave a half-deleted state.
+- **Identity check:** the confirm step aborts if the resolved fileid no longer
+  matches the one recorded in the receipt (the file was replaced/moved).
+- **Audit:** every step emits a structured audit log line and (if `NOTIFY=true`)
+  an OCS notification.
 
 ## RAR opt-in
 

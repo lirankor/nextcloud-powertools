@@ -126,8 +126,8 @@ implement embedded-preview extraction if a reliable method exists, or document u
 
 ---
 
-## F5 — `shred`: guarded permanent delete (file + dir)  🟡 researching (DESTRUCTIVE)
-**Requested:** 2026-06-16.
+## F5 — `shred`: guarded permanent delete (file + dir)  ✅ done (DESTRUCTIVE, opt-in)
+**Requested:** 2026-06-16. **Shipped:** 2026-06-16 (M9). Mock-verified; owner MUST live-validate.
 A deliberately destructive action — the ONE feature that breaks the tool's "never delete user
 content" invariant, so it is the most heavily guarded. Owner's locked decisions:
 - **Behavior:** **permanent purge** — best-effort overwrite → WebDAV `DELETE` → empty from NC

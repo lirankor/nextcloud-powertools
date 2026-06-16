@@ -149,6 +149,45 @@ def build_relations_propfind() -> bytes:
     return _serialize(root)
 
 
+def build_shred_propfind() -> bytes:
+    """PROPFIND body for a shred target's guard props (size/share/mount + id).
+
+    Requests the props the shred scope guards need to inspect on the target
+    (F5): ``oc:fileid`` (verify identity), ``oc:size`` (recursive size for the
+    receipt), ``oc:share-types`` (refuse received shares) and ``nc:mount-type``
+    (refuse external/group/non-local mounts), plus ``d:resourcetype`` for
+    is_dir. ``Depth: 0`` — the target itself only.
+    """
+    root = etree.Element(_qn("d", "propfind"), nsmap=NSMAP)
+    prop = etree.SubElement(root, _qn("d", "prop"))
+    etree.SubElement(prop, _qn("oc", "fileid"))
+    etree.SubElement(prop, _qn("oc", "size"))
+    etree.SubElement(prop, _qn("oc", "share-types"))
+    etree.SubElement(prop, _qn("nc", "mount-type"))
+    etree.SubElement(prop, _qn("d", "resourcetype"))
+    return _serialize(root)
+
+
+def build_count_propfind() -> bytes:
+    """PROPFIND body to count files under a folder (``oc:fileid`` per member)."""
+    root = etree.Element(_qn("d", "propfind"), nsmap=NSMAP)
+    prop = etree.SubElement(root, _qn("d", "prop"))
+    etree.SubElement(prop, _qn("oc", "fileid"))
+    etree.SubElement(prop, _qn("d", "resourcetype"))
+    return _serialize(root)
+
+
+def build_trash_propfind() -> bytes:
+    """PROPFIND body listing a user's trash items with the props shred needs."""
+    root = etree.Element(_qn("d", "propfind"), nsmap=NSMAP)
+    prop = etree.SubElement(root, _qn("d", "prop"))
+    etree.SubElement(prop, _qn("oc", "fileid"))
+    etree.SubElement(prop, _qn("nc", "trashbin-original-location"))
+    etree.SubElement(prop, _qn("nc", "trashbin-filename"))
+    etree.SubElement(prop, _qn("nc", "trashbin-deletion-time"))
+    return _serialize(root)
+
+
 # --------------------------------------------------------------------------- #
 # Parsers
 # --------------------------------------------------------------------------- #
@@ -237,6 +276,83 @@ def parse_systemtags(xml: bytes | str) -> list[TagSpec]:
         tag_id = int(id_text) if id_text and id_text.isdigit() else None
         tags.append(TagSpec(id=tag_id, name=name))
     return tags
+
+
+def parse_shred_props(xml: bytes | str) -> dict[str, object]:
+    """Parse a shred-target PROPFIND (Depth 0) into the guard props.
+
+    Returns a dict with: ``fileid`` (int|None), ``size`` (int|None),
+    ``share_types`` (list[int]) and ``mount_type`` (str|None, e.g.
+    ``shared``/``group``/``external``; empty/None means a normal local file),
+    plus ``is_dir`` (bool). Missing props default to "not shared / not mounted"
+    so the caller's refusal logic only triggers on positive evidence.
+    """
+    root = _parse_multistatus(xml)
+    response = root.find(_qn("d", "response"))
+    out: dict[str, object] = {
+        "fileid": None,
+        "size": None,
+        "share_types": [],
+        "mount_type": None,
+        "is_dir": False,
+    }
+    if response is None:
+        return out
+    fileid_text = _text(response.find(f".//{_qn('oc', 'fileid')}"))
+    if fileid_text and fileid_text.isdigit():
+        out["fileid"] = int(fileid_text)
+    size_text = _text(response.find(f".//{_qn('oc', 'size')}"))
+    if size_text and size_text.isdigit():
+        out["size"] = int(size_text)
+    mount_type = _text(response.find(f".//{_qn('nc', 'mount-type')}"))
+    out["mount_type"] = mount_type or None
+    share_types: list[int] = []
+    st_el = response.find(f".//{_qn('oc', 'share-types')}")
+    if st_el is not None:
+        for child in st_el.findall(_qn("oc", "share-type")):
+            txt = _text(child)
+            if txt and txt.lstrip("-").isdigit():
+                share_types.append(int(txt))
+    out["share_types"] = share_types
+    out["is_dir"] = _is_collection(response)
+    return out
+
+
+def parse_trash_items(xml: bytes | str) -> list[dict[str, object]]:
+    """Parse a trashbin PROPFIND into a list of trash-item dicts.
+
+    Each item: ``node_name`` (the trash node id, taken from the href tail — NEVER
+    constructed), ``fileid`` (int|None, the STABLE oc:fileid matching the live
+    file), ``original_location`` (str|None) and ``deletion_time`` (int|None).
+    The collection root response (the ``/trash`` folder itself) is skipped.
+    """
+    root = _parse_multistatus(xml)
+    items: list[dict[str, object]] = []
+    for response in root.findall(_qn("d", "response")):
+        href = _text(response.find(_qn("d", "href")))
+        if href is None:
+            continue
+        # Node name = last non-empty path segment of the decoded href.
+        node = unquote(href).rstrip("/").rsplit("/", 1)[-1]
+        if not node or node == "trash":
+            # The /trashbin/<user>/trash collection root itself — skip.
+            continue
+        fileid_text = _text(response.find(f".//{_qn('oc', 'fileid')}"))
+        fileid = int(fileid_text) if fileid_text and fileid_text.isdigit() else None
+        original = _text(
+            response.find(f".//{_qn('nc', 'trashbin-original-location')}")
+        )
+        del_text = _text(response.find(f".//{_qn('nc', 'trashbin-deletion-time')}"))
+        deletion_time = int(del_text) if del_text and del_text.isdigit() else None
+        items.append(
+            {
+                "node_name": node,
+                "fileid": fileid,
+                "original_location": original,
+                "deletion_time": deletion_time,
+            }
+        )
+    return items
 
 
 def parse_content_location_id(content_location: str) -> int | None:
